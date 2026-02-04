@@ -1,6 +1,6 @@
 """
-Email Topic Organizer - Standalone Application
-Drag & drop emails, auto-classify by topic, export to Excel
+Email Topic Organizer - Enhanced with Thread/Conversation Parsing
+Handles email chains with multiple back-and-forth replies
 """
 
 import tkinter as tk
@@ -26,11 +26,10 @@ class EmailOrganizer:
     def __init__(self):
         self.emails = []
         self.excel_path = None
-        # Improved vectorizer with better parameters
         self.vectorizer = HashingVectorizer(
-            n_features=200,  # More features for better distinction
+            n_features=200,
             stop_words='english',
-            ngram_range=(1, 2)  # Include bigrams for better context
+            ngram_range=(1, 2)
         )
         self.kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, n_init=10, max_iter=300)
         
@@ -72,6 +71,9 @@ class EmailOrganizer:
         # Extract body
         body = self._extract_body_eml(msg)
         
+        # Parse conversation thread
+        thread_info = self._parse_conversation_thread(body)
+        
         # Create unique ID
         content_for_hash = f"{subject}{from_addr}{body[:500]}"
         msg_id = msg.get('Message-ID', hashlib.md5(content_for_hash.encode()).hexdigest())
@@ -88,7 +90,10 @@ class EmailOrganizer:
             'body': body,
             'issue': issue,
             'milestone': milestone,
-            'filepath': filepath
+            'filepath': filepath,
+            'thread_count': thread_info['count'],
+            'thread_summary': thread_info['summary'],
+            'conversation_dates': thread_info['dates']
         }
     
     def _parse_msg(self, filepath):
@@ -108,7 +113,6 @@ class EmailOrganizer:
                 if date_obj is None:
                     date_obj = datetime.now()
                 elif isinstance(date_obj, str):
-                    # Date is a string, try to parse it
                     try:
                         date_obj = datetime.strptime(date_obj, '%a, %d %b %Y %H:%M:%S %z')
                     except:
@@ -124,8 +128,8 @@ class EmailOrganizer:
             if not body:
                 body = msg.htmlBody or ''
             
-            # Limit body length
-            body = body[:1000]
+            # Parse conversation thread from body
+            thread_info = self._parse_conversation_thread(body)
             
             # Create unique ID
             content_for_hash = f"{subject}{from_addr}{body[:500]}"
@@ -135,7 +139,6 @@ class EmailOrganizer:
             issue = self._extract_marker(subject + ' ' + body, r'(?i)(issue|bug|problem)\s*[:#]?\s*(\w+)')
             milestone = self._extract_marker(subject + ' ' + body, r'(?i)(milestone|phase|sprint)\s*[:#]?\s*(\w+)')
             
-            # Close the message
             msg.close()
             
             return {
@@ -146,15 +149,115 @@ class EmailOrganizer:
                 'body': body,
                 'issue': issue,
                 'milestone': milestone,
-                'filepath': filepath
+                'filepath': filepath,
+                'thread_count': thread_info['count'],
+                'thread_summary': thread_info['summary'],
+                'conversation_dates': thread_info['dates']
             }
             
         except ImportError:
-            # extract-msg not available, show error
             raise Exception("extract-msg library is required for .msg files. Please reinstall the application.")
         except Exception as e:
             print(f"Error parsing MSG file {filepath}: {e}")
             raise
+    
+    def _parse_conversation_thread(self, body_text):
+        """
+        Parse email body to detect conversation threads
+        Returns: dict with thread count, summary, and dates
+        """
+        if not body_text:
+            return {'count': 1, 'summary': '', 'dates': []}
+        
+        # Detect conversation indicators
+        from_pattern = r'From:\s*([^\r\n]+)'
+        sent_pattern = r'Sent:\s*([^\r\n]+)'
+        date_pattern = r'Date:\s*([^\r\n]+)'
+        
+        # Find all "From:" occurrences (indicates forwarded/replied emails)
+        from_matches = re.findall(from_pattern, body_text)
+        sent_matches = re.findall(sent_pattern, body_text)
+        date_matches = re.findall(date_pattern, body_text)
+        
+        # Count emails in thread (original + replies)
+        thread_count = max(len(from_matches), len(sent_matches), 1)
+        
+        # Extract conversation dates
+        conversation_dates = []
+        for date_str in (sent_matches + date_matches):
+            try:
+                # Try to parse date string
+                parsed_date = self._parse_flexible_date(date_str)
+                if parsed_date:
+                    conversation_dates.append(parsed_date)
+            except:
+                pass
+        
+        # Create summary of key points
+        summary = self._extract_conversation_summary(body_text, thread_count)
+        
+        return {
+            'count': thread_count,
+            'summary': summary,
+            'dates': sorted(set(conversation_dates))
+        }
+    
+    def _parse_flexible_date(self, date_str):
+        """Try to parse date from various formats"""
+        date_formats = [
+            '%m/%d/%Y %I:%M:%S %p',  # 12/3/2025 1:15 PM
+            '%m/%d/%Y %I:%M %p',      # 12/3/2025 1:15 PM
+            '%d/%m/%Y %H:%M:%S',      # 03/12/2025 13:15:00
+            '%Y-%m-%d %H:%M:%S',      # 2025-12-03 13:15:00
+            '%a, %d %b %Y %H:%M:%S',  # Tue, 3 Dec 2025 13:15:00
+            '%B %d, %Y %I:%M %p',     # December 3, 2025 1:15 PM
+        ]
+        
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(date_str.strip(), fmt)
+            except:
+                continue
+        return None
+    
+    def _extract_conversation_summary(self, body_text, thread_count):
+        """
+        Extract key points from conversation thread
+        Returns a concise summary of the discussion
+        """
+        if thread_count <= 1:
+            # Single email, take first meaningful paragraph
+            lines = body_text.split('\n')
+            meaningful_lines = [line.strip() for line in lines if len(line.strip()) > 20 and not line.strip().startswith('>')]
+            return ' '.join(meaningful_lines[:3])[:300]
+        
+        # Multi-email thread - extract key points
+        summary_parts = []
+        
+        # Split by common separators
+        sections = re.split(r'_{5,}|From:|Sent:|Original Message', body_text, flags=re.IGNORECASE)
+        
+        for section in sections[:5]:  # Take first 5 sections
+            lines = section.split('\n')
+            # Find meaningful content (not headers, not quoted)
+            content_lines = []
+            for line in lines:
+                clean_line = line.strip()
+                # Skip headers, quotes, and short lines
+                if (len(clean_line) > 30 and 
+                    not clean_line.startswith('>') and
+                    not clean_line.startswith('-----') and
+                    not any(header in clean_line for header in ['Subject:', 'To:', 'Cc:', 'Date:', 'From:'])):
+                    content_lines.append(clean_line)
+                    if len(content_lines) >= 2:  # Take max 2 lines per section
+                        break
+            
+            if content_lines:
+                summary_parts.extend(content_lines)
+        
+        # Combine and limit length
+        full_summary = ' | '.join(summary_parts)
+        return full_summary[:500] if full_summary else 'Conversation thread'
     
     def _extract_body_eml(self, msg):
         """Extract email body text from EML"""
@@ -172,7 +275,7 @@ class EmailOrganizer:
             except:
                 body = str(msg)
         
-        return body[:1000]  # Limit to first 1000 characters
+        return body
     
     def _extract_marker(self, text, pattern):
         """Extract issue or milestone markers"""
@@ -184,26 +287,18 @@ class EmailOrganizer:
     def classify_topics(self):
         """Classify emails into topics using clustering"""
         if len(self.emails) < 2:
-            # Not enough emails to cluster
             for email_data in self.emails:
                 email_data['topic'] = 'Topic_1'
             return
         
-        # Prepare text for clustering - use both subject and body
-        texts = [f"{e['subject']} {e['subject']} {e['body']}" for e in self.emails]
+        # Use subject + body + conversation summary for better clustering
+        texts = [f"{e['subject']} {e['subject']} {e['body'][:1000]} {e.get('thread_summary', '')}" for e in self.emails]
         
-        # Vectorize
         X = self.vectorizer.fit_transform(texts)
-        
-        # Adjust number of clusters based on email count
-        # Use fewer clusters for better grouping
         n_clusters = min(5, max(2, len(self.emails) // 5))
         self.kmeans.set_params(n_clusters=n_clusters)
-        
-        # Cluster
         labels = self.kmeans.fit_predict(X)
         
-        # Assign topics
         for i, email_data in enumerate(self.emails):
             email_data['topic'] = f'Topic_{labels[i] + 1}'
     
@@ -219,8 +314,7 @@ class EmailOrganizer:
             if 'Index' in wb.sheetnames:
                 ws = wb['Index']
                 for row in ws.iter_rows(min_row=2, values_only=True):
-                    if row[0]:  # Message ID column
-                        # Clean up message ID
+                    if row[0]:
                         msg_id = str(row[0]).strip()
                         processed_ids.add(msg_id)
             wb.close()
@@ -231,14 +325,12 @@ class EmailOrganizer:
     
     def save_to_excel(self, filepath):
         """Save emails to Excel with all required sheets"""
-        # Load existing file or create new
         if os.path.exists(filepath):
             wb = openpyxl.load_workbook(filepath)
         else:
             wb = openpyxl.Workbook()
-            wb.remove(wb.active)  # Remove default sheet
+            wb.remove(wb.active)
         
-        # Ensure all required sheets exist
         if 'Emails' not in wb.sheetnames:
             wb.create_sheet('Emails', 0)
         if 'Summary' not in wb.sheetnames:
@@ -248,42 +340,45 @@ class EmailOrganizer:
         if 'Index' not in wb.sheetnames:
             wb.create_sheet('Index', 3)
         
-        # Write to Emails sheet (append-only)
         self._write_emails_sheet(wb['Emails'])
-        
-        # Write to Summary sheet (regenerate)
         self._write_summary_sheet(wb)
-        
-        # Write to TopicMap sheet (initialize if empty)
         self._write_topicmap_sheet(wb)
-        
-        # Write to Index sheet (append-only)
         self._write_index_sheet(wb['Index'])
         
-        # Save
         wb.save(filepath)
         wb.close()
     
     def _write_emails_sheet(self, ws):
-        """Append new emails to Emails sheet"""
+        """Append new emails to Emails sheet with conversation info"""
         # Check if headers exist
         if ws.max_row == 1 or ws.cell(1, 1).value != 'Date':
-            ws.append(['Date', 'Topic', 'Subject', 'From', 'Issue', 'Milestone', 'Body Preview'])
+            headers = ['Date', 'Topic', 'Subject', 'From', 'Thread Count', 'Conversation Summary', 
+                      'Issue', 'Milestone', 'Body Preview']
+            ws.append(headers)
             self._style_header(ws)
         
         # Append new emails
         for email_data in self.emails:
+            # Format conversation dates
+            conv_dates = email_data.get('conversation_dates', [])
+            date_range = ''
+            if len(conv_dates) >= 2:
+                date_range = f"{conv_dates[0].strftime('%m/%d/%Y')} - {conv_dates[-1].strftime('%m/%d/%Y')}"
+            elif len(conv_dates) == 1:
+                date_range = conv_dates[0].strftime('%m/%d/%Y')
+            
             ws.append([
                 email_data['date'].strftime('%Y-%m-%d %H:%M:%S'),
                 email_data['topic'],
                 email_data['subject'],
                 email_data['from'],
-                email_data['issue'] or '',
-                email_data['milestone'] or '',
+                email_data.get('thread_count', 1),
+                email_data.get('thread_summary', '')[:500],  # Limit to 500 chars
+                email_data.get('issue', '') or '',
+                email_data.get('milestone', '') or '',
                 email_data['body'][:200] or ''
             ])
         
-        # Auto-adjust column widths
         self._auto_adjust_columns(ws)
     
     def _auto_adjust_columns(self, ws):
@@ -301,8 +396,7 @@ class EmailOrganizer:
                 except:
                     pass
             
-            # Set column width with limits
-            adjusted_width = min(max(length + 2, 10), 60)
+            adjusted_width = min(max(length + 2, 10), 80)  # Increased max width for summary column
             ws.column_dimensions[column].width = adjusted_width
     
     def _write_summary_sheet(self, wb):
@@ -310,11 +404,9 @@ class EmailOrganizer:
         ws = wb['Summary']
         ws.delete_rows(1, ws.max_row)
         
-        # Headers
-        ws.append(['Topic', 'Count', 'Latest Date', 'Mapped Topic Name'])
+        ws.append(['Topic', 'Count', 'Latest Date', 'Total Threads', 'Mapped Topic Name'])
         self._style_header(ws)
         
-        # Get all emails from Emails sheet
         emails_ws = wb['Emails']
         topic_data = {}
         
@@ -322,13 +414,14 @@ class EmailOrganizer:
             if row[1]:  # Topic column
                 topic = row[1]
                 date_str = row[0]
+                thread_count = row[4] if len(row) > 4 else 1
                 
                 if topic not in topic_data:
-                    topic_data[topic] = {'count': 0, 'latest': None}
+                    topic_data[topic] = {'count': 0, 'latest': None, 'threads': 0}
                 
                 topic_data[topic]['count'] += 1
+                topic_data[topic]['threads'] += thread_count
                 
-                # Update latest date
                 try:
                     date_obj = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
                     if topic_data[topic]['latest'] is None or date_obj > topic_data[topic]['latest']:
@@ -336,10 +429,8 @@ class EmailOrganizer:
                 except:
                     pass
         
-        # Get topic mappings
         topicmap = self._get_topic_mappings(wb)
         
-        # Write summary rows
         for topic in sorted(topic_data.keys()):
             latest = topic_data[topic]['latest']
             latest_str = latest.strftime('%Y-%m-%d %H:%M:%S') if latest else 'N/A'
@@ -349,23 +440,21 @@ class EmailOrganizer:
                 topic,
                 topic_data[topic]['count'],
                 latest_str,
+                topic_data[topic]['threads'],
                 mapped_name
             ])
         
-        # Auto-adjust columns
         self._auto_adjust_columns(ws)
     
     def _write_topicmap_sheet(self, wb):
         """Initialize or update TopicMap sheet with all topics"""
-        # Get all unique topics from Emails sheet
         emails_ws = wb['Emails']
         all_topics = set()
         
         for row in emails_ws.iter_rows(min_row=2, values_only=True):
-            if row[1]:  # Topic column
+            if row[1]:
                 all_topics.add(row[1])
         
-        # Get existing mappings
         ws = wb['TopicMap']
         existing_mappings = {}
         
@@ -374,17 +463,14 @@ class EmailOrganizer:
                 if row[0]:
                     existing_mappings[row[0]] = row[1] or ''
         
-        # Clear and rewrite
         ws.delete_rows(1, ws.max_row)
         ws.append(['Original Topic', 'Custom Name'])
         self._style_header(ws)
         
-        # Add all topics (preserve existing custom names)
         for topic in sorted(all_topics):
             custom_name = existing_mappings.get(topic, '')
             ws.append([topic, custom_name])
         
-        # Auto-adjust columns
         self._auto_adjust_columns(ws)
     
     def _write_index_sheet(self, ws):
@@ -393,10 +479,8 @@ class EmailOrganizer:
             ws.append(['Message ID', 'Processed Date', 'Filename'])
             self._style_header(ws)
         
-        # Append new email IDs
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         for email_data in self.emails:
-            # Clean up message ID
             msg_id = str(email_data['message_id']).strip()
             ws.append([
                 msg_id,
@@ -404,7 +488,6 @@ class EmailOrganizer:
                 Path(email_data['filepath']).name
             ])
         
-        # Auto-adjust columns
         self._auto_adjust_columns(ws)
     
     def _get_topic_mappings(self, wb):
@@ -431,7 +514,7 @@ class EmailOrganizer:
 class EmailOrganizerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Email Topic Organizer")
+        self.root.title("Email Topic Organizer - With Thread Detection")
         self.root.geometry("700x550")
         
         self.organizer = EmailOrganizer()
@@ -443,31 +526,27 @@ class EmailOrganizerGUI:
     
     def setup_ui(self):
         """Create the user interface"""
-        # Title
         title = tk.Label(self.root, text="📧 Email Topic Organizer", 
                         font=('Arial', 16, 'bold'))
         title.pack(pady=10)
         
-        # Instructions
         instructions = tk.Label(self.root, 
-            text="Use Browse button to select .eml or .msg files\nEmails will be automatically sorted by topic",
+            text="Use Browse button to select .eml or .msg files\nAutomatically detects email threads and conversation history",
             justify=tk.CENTER)
         instructions.pack(pady=5)
         
-        # Drop zone
         drop_frame = tk.Frame(self.root, bg='#e8f4f8', relief=tk.SOLID, borderwidth=2)
         drop_frame.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
         
-        drop_text = "📁 Select files using Browse button\n\nSupported: .eml, .msg"
+        drop_text = "📁 Select files using Browse button\n\nSupported: .eml, .msg\nThreads: Auto-detected"
         if self.drag_drop_available:
-            drop_text = "📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg"
+            drop_text = "📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg\nThreads: Auto-detected"
         
         self.drop_label = tk.Label(drop_frame, 
             text=drop_text,
             bg='#e8f4f8', font=('Arial', 12), justify=tk.CENTER)
         self.drop_label.pack(expand=True)
         
-        # File list
         list_frame = tk.Frame(self.root)
         list_frame.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
         
@@ -478,7 +557,6 @@ class EmailOrganizerGUI:
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.file_listbox.yview)
         
-        # Buttons
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
         
@@ -496,7 +574,6 @@ class EmailOrganizerGUI:
                                      font=('Arial', 10, 'bold'))
         self.process_btn.pack(side=tk.LEFT, padx=5)
         
-        # Status
         self.status_label = tk.Label(self.root, text="Ready - Use Browse button to select files", fg='green')
         self.status_label.pack(pady=5)
     
@@ -504,14 +581,12 @@ class EmailOrganizerGUI:
         """Enable drag and drop functionality if available"""
         try:
             from tkinterdnd2 import TkinterDnD
-            # Try to enable drag and drop
             self.root.drop_target_register('DND_Files')
             self.root.dnd_bind('<<Drop>>', self.on_drop)
             self.drag_drop_available = True
-            self.drop_label.config(text="📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg")
+            self.drop_label.config(text="📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg\nThreads: Auto-detected")
             self.status_label.config(text="Ready - Drag & drop enabled")
         except Exception as e:
-            # Drag and drop not available, that's ok
             print(f"Drag and drop not available: {e}")
             self.drag_drop_available = False
     
@@ -554,7 +629,6 @@ class EmailOrganizerGUI:
             messagebox.showwarning("No Files", "Please add email files first")
             return
         
-        # Ask for Excel output location
         excel_path = filedialog.asksaveasfilename(
             title="Save Excel File As",
             defaultextension=".xlsx",
@@ -564,37 +638,34 @@ class EmailOrganizerGUI:
         if not excel_path:
             return
         
-        self.update_status("Processing emails...")
+        self.update_status("Processing emails and detecting threads...")
         self.root.update()
         
         try:
-            # Load existing processed IDs
             processed_ids = self.organizer.load_existing_excel(excel_path)
             
-            # Parse emails
             new_emails = 0
             skipped = 0
             failed_files = []
+            total_threads = 0
             
             for filepath in self.dropped_files:
                 try:
                     email_data = self.organizer.parse_email_file(filepath)
                     if email_data:
-                        # Clean up message ID for comparison
                         msg_id = str(email_data['message_id']).strip()
                         
                         if msg_id not in processed_ids:
                             self.organizer.emails.append(email_data)
                             new_emails += 1
+                            total_threads += email_data.get('thread_count', 1)
                         else:
                             skipped += 1
-                            print(f"Skipped duplicate: {Path(filepath).name}")
                 except Exception as e:
                     failed_files.append((Path(filepath).name, str(e)))
                     print(f"Failed to parse {filepath}: {e}")
             
-            # Show info about processing
-            info_msg = f"Processed: {new_emails} new emails"
+            info_msg = f"Processed: {new_emails} emails ({total_threads} messages in threads)"
             if skipped > 0:
                 info_msg += f"\nSkipped: {skipped} duplicates"
             if failed_files:
@@ -609,22 +680,18 @@ class EmailOrganizerGUI:
                 self.update_status("No new emails to process")
                 return
             
-            # Classify topics
             self.update_status("Classifying topics...")
             self.root.update()
             self.organizer.classify_topics()
             
-            # Save to Excel
-            self.update_status("Saving to Excel...")
+            self.update_status("Saving to Excel with conversation summaries...")
             self.root.update()
             self.organizer.save_to_excel(excel_path)
             
-            # Success
             messagebox.showinfo("Success", f"{info_msg}\n\nSaved to:\n{excel_path}")
             
-            self.update_status(f"✅ Success! Processed {new_emails} emails")
+            self.update_status(f"✅ Success! Processed {new_emails} emails with {total_threads} messages")
             
-            # Clear for next batch
             self.clear_files()
             self.organizer.emails = []
             
@@ -643,11 +710,9 @@ class EmailOrganizerGUI:
 
 def main():
     try:
-        # Try to use TkinterDnD if available
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
     except:
-        # Fall back to regular Tkinter
         root = tk.Tk()
     
     app = EmailOrganizerGUI(root)
