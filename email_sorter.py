@@ -96,11 +96,20 @@ class EmailOrganizer:
             subject = msg.subject or 'No Subject'
             from_addr = msg.sender or 'Unknown'
             
-            # Get date
+            # Get date - handle both datetime and string formats
             try:
                 date_obj = msg.date
                 if date_obj is None:
                     date_obj = datetime.now()
+                elif isinstance(date_obj, str):
+                    # Date is a string, try to parse it
+                    try:
+                        date_obj = datetime.strptime(date_obj, '%a, %d %b %Y %H:%M:%S %z')
+                    except:
+                        try:
+                            date_obj = datetime.strptime(date_obj, '%Y-%m-%d %H:%M:%S')
+                        except:
+                            date_obj = datetime.now()
             except:
                 date_obj = datetime.now()
             
