@@ -15,6 +15,7 @@ from email import policy
 from email.parser import BytesParser
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.cluster import MiniBatchKMeans
 import warnings
@@ -25,8 +26,13 @@ class EmailOrganizer:
     def __init__(self):
         self.emails = []
         self.excel_path = None
-        self.vectorizer = HashingVectorizer(n_features=100, stop_words='english')
-        self.kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, n_init=3)
+        # Improved vectorizer with better parameters
+        self.vectorizer = HashingVectorizer(
+            n_features=200,  # More features for better distinction
+            stop_words='english',
+            ngram_range=(1, 2)  # Include bigrams for better context
+        )
+        self.kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, n_init=10, max_iter=300)
         
     def parse_email_file(self, filepath):
         """Parse .eml or .msg file"""
@@ -183,14 +189,15 @@ class EmailOrganizer:
                 email_data['topic'] = 'Topic_1'
             return
         
-        # Prepare text for clustering
-        texts = [f"{e['subject']} {e['body']}" for e in self.emails]
+        # Prepare text for clustering - use both subject and body
+        texts = [f"{e['subject']} {e['subject']} {e['body']}" for e in self.emails]
         
         # Vectorize
         X = self.vectorizer.fit_transform(texts)
         
         # Adjust number of clusters based on email count
-        n_clusters = min(5, max(2, len(self.emails) // 3))
+        # Use fewer clusters for better grouping
+        n_clusters = min(5, max(2, len(self.emails) // 5))
         self.kmeans.set_params(n_clusters=n_clusters)
         
         # Cluster
@@ -213,7 +220,9 @@ class EmailOrganizer:
                 ws = wb['Index']
                 for row in ws.iter_rows(min_row=2, values_only=True):
                     if row[0]:  # Message ID column
-                        processed_ids.add(row[0])
+                        # Clean up message ID
+                        msg_id = str(row[0]).strip()
+                        processed_ids.add(msg_id)
             wb.close()
         except Exception as e:
             print(f"Error loading existing Excel: {e}")
@@ -246,7 +255,7 @@ class EmailOrganizer:
         self._write_summary_sheet(wb)
         
         # Write to TopicMap sheet (initialize if empty)
-        self._write_topicmap_sheet(wb['TopicMap'])
+        self._write_topicmap_sheet(wb)
         
         # Write to Index sheet (append-only)
         self._write_index_sheet(wb['Index'])
@@ -269,10 +278,32 @@ class EmailOrganizer:
                 email_data['topic'],
                 email_data['subject'],
                 email_data['from'],
-                email_data['issue'],
-                email_data['milestone'],
-                email_data['body'][:200]
+                email_data['issue'] or '',
+                email_data['milestone'] or '',
+                email_data['body'][:200] or ''
             ])
+        
+        # Auto-adjust column widths
+        self._auto_adjust_columns(ws)
+    
+    def _auto_adjust_columns(self, ws):
+        """Auto-adjust column widths for readability"""
+        for column_cells in ws.columns:
+            length = 0
+            column = column_cells[0].column_letter
+            
+            for cell in column_cells:
+                try:
+                    if cell.value:
+                        cell_length = len(str(cell.value))
+                        if cell_length > length:
+                            length = cell_length
+                except:
+                    pass
+            
+            # Set column width with limits
+            adjusted_width = min(max(length + 2, 10), 60)
+            ws.column_dimensions[column].width = adjusted_width
     
     def _write_summary_sheet(self, wb):
         """Regenerate Summary sheet with topic statistics"""
@@ -320,18 +351,41 @@ class EmailOrganizer:
                 latest_str,
                 mapped_name
             ])
+        
+        # Auto-adjust columns
+        self._auto_adjust_columns(ws)
     
-    def _write_topicmap_sheet(self, ws):
-        """Initialize TopicMap sheet if empty"""
-        if ws.max_row <= 1 or ws.cell(1, 1).value != 'Original Topic':
-            ws.delete_rows(1, ws.max_row)
-            ws.append(['Original Topic', 'Custom Name'])
-            self._style_header(ws)
-            
-            # Add all unique topics
-            unique_topics = set(e['topic'] for e in self.emails)
-            for topic in sorted(unique_topics):
-                ws.append([topic, ''])
+    def _write_topicmap_sheet(self, wb):
+        """Initialize or update TopicMap sheet with all topics"""
+        # Get all unique topics from Emails sheet
+        emails_ws = wb['Emails']
+        all_topics = set()
+        
+        for row in emails_ws.iter_rows(min_row=2, values_only=True):
+            if row[1]:  # Topic column
+                all_topics.add(row[1])
+        
+        # Get existing mappings
+        ws = wb['TopicMap']
+        existing_mappings = {}
+        
+        if ws.max_row > 1 and ws.cell(1, 1).value == 'Original Topic':
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row[0]:
+                    existing_mappings[row[0]] = row[1] or ''
+        
+        # Clear and rewrite
+        ws.delete_rows(1, ws.max_row)
+        ws.append(['Original Topic', 'Custom Name'])
+        self._style_header(ws)
+        
+        # Add all topics (preserve existing custom names)
+        for topic in sorted(all_topics):
+            custom_name = existing_mappings.get(topic, '')
+            ws.append([topic, custom_name])
+        
+        # Auto-adjust columns
+        self._auto_adjust_columns(ws)
     
     def _write_index_sheet(self, ws):
         """Append processed email IDs to Index sheet"""
@@ -342,11 +396,16 @@ class EmailOrganizer:
         # Append new email IDs
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         for email_data in self.emails:
+            # Clean up message ID
+            msg_id = str(email_data['message_id']).strip()
             ws.append([
-                email_data['message_id'],
+                msg_id,
                 now,
                 Path(email_data['filepath']).name
             ])
+        
+        # Auto-adjust columns
+        self._auto_adjust_columns(ws)
     
     def _get_topic_mappings(self, wb):
         """Get topic name mappings from TopicMap sheet"""
@@ -354,8 +413,8 @@ class EmailOrganizer:
         if 'TopicMap' in wb.sheetnames:
             ws = wb['TopicMap']
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[0] and row[1]:
-                    mappings[row[0]] = row[1]
+                if row[0]:
+                    mappings[row[0]] = row[1] or ''
         return mappings
     
     def _style_header(self, ws):
@@ -514,27 +573,39 @@ class EmailOrganizerGUI:
             
             # Parse emails
             new_emails = 0
+            skipped = 0
             failed_files = []
+            
             for filepath in self.dropped_files:
                 try:
                     email_data = self.organizer.parse_email_file(filepath)
-                    if email_data and email_data['message_id'] not in processed_ids:
-                        self.organizer.emails.append(email_data)
-                        new_emails += 1
+                    if email_data:
+                        # Clean up message ID for comparison
+                        msg_id = str(email_data['message_id']).strip()
+                        
+                        if msg_id not in processed_ids:
+                            self.organizer.emails.append(email_data)
+                            new_emails += 1
+                        else:
+                            skipped += 1
+                            print(f"Skipped duplicate: {Path(filepath).name}")
                 except Exception as e:
                     failed_files.append((Path(filepath).name, str(e)))
                     print(f"Failed to parse {filepath}: {e}")
             
-            # Show warning if some files failed
+            # Show info about processing
+            info_msg = f"Processed: {new_emails} new emails"
+            if skipped > 0:
+                info_msg += f"\nSkipped: {skipped} duplicates"
             if failed_files:
-                failed_list = "\n".join([f"- {name}: {error[:50]}..." for name, error in failed_files[:5]])
-                messagebox.showwarning("Some Files Failed", 
-                    f"{len(failed_files)} file(s) could not be processed:\n\n{failed_list}\n\n" +
-                    f"Successfully processed: {new_emails} files")
+                failed_list = "\n".join([f"- {name}" for name, error in failed_files[:5]])
+                info_msg += f"\nFailed: {len(failed_files)} files\n\n{failed_list}"
+                if len(failed_files) > 5:
+                    info_msg += f"\n... and {len(failed_files) - 5} more"
             
             if new_emails == 0:
                 messagebox.showinfo("No New Emails", 
-                    "All selected emails have already been processed or failed to parse")
+                    f"All selected emails have already been processed or failed to parse.\n\n{info_msg}")
                 self.update_status("No new emails to process")
                 return
             
@@ -549,8 +620,7 @@ class EmailOrganizerGUI:
             self.organizer.save_to_excel(excel_path)
             
             # Success
-            messagebox.showinfo("Success", 
-                f"Processed {new_emails} new emails!\n\nSaved to:\n{excel_path}")
+            messagebox.showinfo("Success", f"{info_msg}\n\nSaved to:\n{excel_path}")
             
             self.update_status(f"✅ Success! Processed {new_emails} emails")
             
