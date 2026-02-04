@@ -357,6 +357,7 @@ class EmailOrganizerGUI:
         
         self.organizer = EmailOrganizer()
         self.dropped_files = []
+        self.drag_drop_available = False
         
         self.setup_ui()
         self.setup_drag_drop()
@@ -370,7 +371,7 @@ class EmailOrganizerGUI:
         
         # Instructions
         instructions = tk.Label(self.root, 
-            text="Drag & drop .eml or .msg files below\nEmails will be automatically sorted by topic",
+            text="Use Browse button to select .eml or .msg files\nEmails will be automatically sorted by topic",
             justify=tk.CENTER)
         instructions.pack(pady=5)
         
@@ -378,8 +379,12 @@ class EmailOrganizerGUI:
         drop_frame = tk.Frame(self.root, bg='#e8f4f8', relief=tk.SOLID, borderwidth=2)
         drop_frame.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
         
+        drop_text = "📁 Select files using Browse button\n\nSupported: .eml, .msg"
+        if self.drag_drop_available:
+            drop_text = "📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg"
+        
         self.drop_label = tk.Label(drop_frame, 
-            text="📁 Drop email files here\n\nSupported: .eml, .msg",
+            text=drop_text,
             bg='#e8f4f8', font=('Arial', 12), justify=tk.CENTER)
         self.drop_label.pack(expand=True)
         
@@ -413,18 +418,31 @@ class EmailOrganizerGUI:
         self.process_btn.pack(side=tk.LEFT, padx=5)
         
         # Status
-        self.status_label = tk.Label(self.root, text="Ready", fg='green')
+        self.status_label = tk.Label(self.root, text="Ready - Use Browse button to select files", fg='green')
         self.status_label.pack(pady=5)
     
     def setup_drag_drop(self):
-        """Enable drag and drop functionality"""
-        self.root.drop_target_register('DND_Files')
-        self.root.dnd_bind('<<Drop>>', self.on_drop)
+        """Enable drag and drop functionality if available"""
+        try:
+            from tkinterdnd2 import TkinterDnD
+            # Try to enable drag and drop
+            self.root.drop_target_register('DND_Files')
+            self.root.dnd_bind('<<Drop>>', self.on_drop)
+            self.drag_drop_available = True
+            self.drop_label.config(text="📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg")
+            self.status_label.config(text="Ready - Drag & drop enabled")
+        except Exception as e:
+            # Drag and drop not available, that's ok
+            print(f"Drag and drop not available: {e}")
+            self.drag_drop_available = False
     
     def on_drop(self, event):
         """Handle dropped files"""
-        files = self.root.tk.splitlist(event.data)
-        self.add_files(files)
+        try:
+            files = self.root.tk.splitlist(event.data)
+            self.add_files(files)
+        except Exception as e:
+            print(f"Error handling drop: {e}")
     
     def browse_files(self):
         """Browse for email files"""
@@ -519,22 +537,17 @@ class EmailOrganizerGUI:
 
 
 def main():
-    root = tk.TkinterDnD.Tk()
+    try:
+        # Try to use TkinterDnD if available
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except:
+        # Fall back to regular Tkinter
+        root = tk.Tk()
+    
     app = EmailOrganizerGUI(root)
     root.mainloop()
 
 
 if __name__ == '__main__':
-    # Import tkinterdnd2 for drag & drop
-    try:
-        from tkinterdnd2 import TkinterDnD
-        tk.TkinterDnD = TkinterDnD
-        main()
-    except ImportError:
-        print("Error: tkinterdnd2 not installed")
-        print("Installing required packages...")
-        import subprocess
-        subprocess.check_call(['pip', 'install', 'tkinterdnd2'])
-        from tkinterdnd2 import TkinterDnD
-        tk.TkinterDnD = TkinterDnD
-        main()
+    main()
