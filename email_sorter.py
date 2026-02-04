@@ -31,41 +31,97 @@ class EmailOrganizer:
     def parse_email_file(self, filepath):
         """Parse .eml or .msg file"""
         try:
-            with open(filepath, 'rb') as f:
-                if filepath.lower().endswith('.eml'):
-                    msg = BytesParser(policy=policy.default).parse(f)
-                else:
-                    # Basic .msg support - read as text
-                    content = f.read()
-                    # Try to extract subject and body from .msg
-                    msg = self._parse_msg_basic(content)
-                    if msg is None:
-                        return None
-                        
-            # Extract email data
-            subject = msg.get('Subject', 'No Subject')
-            from_addr = msg.get('From', 'Unknown')
-            date_str = msg.get('Date', '')
+            if filepath.lower().endswith('.eml'):
+                return self._parse_eml(filepath)
+            elif filepath.lower().endswith('.msg'):
+                return self._parse_msg(filepath)
+            else:
+                print(f"Unsupported file type: {filepath}")
+                return None
+        except Exception as e:
+            print(f"Error parsing {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _parse_eml(self, filepath):
+        """Parse .eml file"""
+        with open(filepath, 'rb') as f:
+            msg = BytesParser(policy=policy.default).parse(f)
+        
+        # Extract email data
+        subject = msg.get('Subject', 'No Subject')
+        from_addr = msg.get('From', 'Unknown')
+        date_str = msg.get('Date', '')
+        
+        # Parse date
+        try:
+            if date_str:
+                date_obj = email.utils.parsedate_to_datetime(date_str)
+            else:
+                date_obj = datetime.now()
+        except:
+            date_obj = datetime.now()
+        
+        # Extract body
+        body = self._extract_body_eml(msg)
+        
+        # Create unique ID
+        content_for_hash = f"{subject}{from_addr}{body[:500]}"
+        msg_id = msg.get('Message-ID', hashlib.md5(content_for_hash.encode()).hexdigest())
+        
+        # Extract issue/milestone markers
+        issue = self._extract_marker(subject + ' ' + body, r'(?i)(issue|bug|problem)\s*[:#]?\s*(\w+)')
+        milestone = self._extract_marker(subject + ' ' + body, r'(?i)(milestone|phase|sprint)\s*[:#]?\s*(\w+)')
+        
+        return {
+            'message_id': msg_id,
+            'subject': subject,
+            'from': from_addr,
+            'date': date_obj,
+            'body': body,
+            'issue': issue,
+            'milestone': milestone,
+            'filepath': filepath
+        }
+    
+    def _parse_msg(self, filepath):
+        """Parse .msg file using extract-msg library"""
+        try:
+            import extract_msg
             
-            # Parse date
+            msg = extract_msg.Message(filepath)
+            
+            # Extract email data
+            subject = msg.subject or 'No Subject'
+            from_addr = msg.sender or 'Unknown'
+            
+            # Get date
             try:
-                if date_str:
-                    date_obj = email.utils.parsedate_to_datetime(date_str)
-                else:
+                date_obj = msg.date
+                if date_obj is None:
                     date_obj = datetime.now()
             except:
                 date_obj = datetime.now()
             
             # Extract body
-            body = self._extract_body(msg)
+            body = msg.body or ''
+            if not body:
+                body = msg.htmlBody or ''
+            
+            # Limit body length
+            body = body[:1000]
             
             # Create unique ID
             content_for_hash = f"{subject}{from_addr}{body[:500]}"
-            msg_id = msg.get('Message-ID', hashlib.md5(content_for_hash.encode()).hexdigest())
+            msg_id = msg.messageId or hashlib.md5(content_for_hash.encode()).hexdigest()
             
             # Extract issue/milestone markers
             issue = self._extract_marker(subject + ' ' + body, r'(?i)(issue|bug|problem)\s*[:#]?\s*(\w+)')
             milestone = self._extract_marker(subject + ' ' + body, r'(?i)(milestone|phase|sprint)\s*[:#]?\s*(\w+)')
+            
+            # Close the message
+            msg.close()
             
             return {
                 'message_id': msg_id,
@@ -77,61 +133,16 @@ class EmailOrganizer:
                 'milestone': milestone,
                 'filepath': filepath
             }
+            
+        except ImportError:
+            # extract-msg not available, show error
+            raise Exception("extract-msg library is required for .msg files. Please reinstall the application.")
         except Exception as e:
-            print(f"Error parsing {filepath}: {e}")
-            return None
+            print(f"Error parsing MSG file {filepath}: {e}")
+            raise
     
-    def _parse_msg_basic(self, content):
-        """Basic .msg file parsing"""
-        try:
-            # Convert bytes to string (try different encodings)
-            text = None
-            for encoding in ['utf-8', 'latin-1', 'cp1252']:
-                try:
-                    text = content.decode(encoding, errors='ignore')
-                    break
-                except:
-                    continue
-            
-            if not text:
-                return None
-            
-            # Create a simple email-like object
-            class SimpleMsg:
-                def __init__(self):
-                    self.data = {}
-                def get(self, key, default=''):
-                    return self.data.get(key, default)
-            
-            msg = SimpleMsg()
-            
-            # Try to extract subject
-            subject_match = re.search(r'Subject:\s*(.+?)[\r\n]', text)
-            if subject_match:
-                msg.data['Subject'] = subject_match.group(1).strip()
-            
-            # Try to extract from
-            from_match = re.search(r'From:\s*(.+?)[\r\n]', text)
-            if from_match:
-                msg.data['From'] = from_match.group(1).strip()
-            
-            # Try to extract date
-            date_match = re.search(r'Date:\s*(.+?)[\r\n]', text)
-            if date_match:
-                msg.data['Date'] = date_match.group(1).strip()
-            
-            # Body is everything (simplified)
-            msg.data['_body'] = text
-            
-            return msg
-        except:
-            return None
-    
-    def _extract_body(self, msg):
-        """Extract email body text"""
-        if hasattr(msg, 'data') and '_body' in msg.data:
-            return msg.data['_body'][:1000]  # First 1000 chars
-            
+    def _extract_body_eml(self, msg):
+        """Extract email body text from EML"""
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
@@ -494,15 +505,27 @@ class EmailOrganizerGUI:
             
             # Parse emails
             new_emails = 0
+            failed_files = []
             for filepath in self.dropped_files:
-                email_data = self.organizer.parse_email_file(filepath)
-                if email_data and email_data['message_id'] not in processed_ids:
-                    self.organizer.emails.append(email_data)
-                    new_emails += 1
+                try:
+                    email_data = self.organizer.parse_email_file(filepath)
+                    if email_data and email_data['message_id'] not in processed_ids:
+                        self.organizer.emails.append(email_data)
+                        new_emails += 1
+                except Exception as e:
+                    failed_files.append((Path(filepath).name, str(e)))
+                    print(f"Failed to parse {filepath}: {e}")
+            
+            # Show warning if some files failed
+            if failed_files:
+                failed_list = "\n".join([f"- {name}: {error[:50]}..." for name, error in failed_files[:5]])
+                messagebox.showwarning("Some Files Failed", 
+                    f"{len(failed_files)} file(s) could not be processed:\n\n{failed_list}\n\n" +
+                    f"Successfully processed: {new_emails} files")
             
             if new_emails == 0:
                 messagebox.showinfo("No New Emails", 
-                    "All selected emails have already been processed")
+                    "All selected emails have already been processed or failed to parse")
                 self.update_status("No new emails to process")
                 return
             
@@ -527,6 +550,9 @@ class EmailOrganizerGUI:
             self.organizer.emails = []
             
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error processing emails:\n{error_details}")
             messagebox.showerror("Error", f"Failed to process emails:\n{str(e)}")
             self.update_status("❌ Error occurred")
     
