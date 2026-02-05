@@ -351,9 +351,19 @@ class EmailOrganizer:
     
     def classify_topics_with_bert(self):
         """Classify emails using BERT embeddings or fallback to improved K-Means"""
-        if not self.bert_model and not self.use_fallback_clustering:
+        # Check if we should use fallback
+        if self.use_fallback_clustering:
+            print("Using improved K-Means (user selected fallback)")
+            return self._classify_with_improved_kmeans()
+        
+        # Try to initialize BERT if not already done
+        if not self.bert_model:
             if not self.initialize_bert():
-                return False
+                # initialize_bert may have set use_fallback_clustering
+                if self.use_fallback_clustering:
+                    return self._classify_with_improved_kmeans()
+                else:
+                    return False
         
         if len(self.emails) < 2:
             for email_data in self.emails:
@@ -361,13 +371,15 @@ class EmailOrganizer:
                 email_data['confidence'] = 1.0
             return True
         
-        print(f"Processing {len(self.emails)} emails...")
+        print(f"Processing {len(self.emails)} emails with BERT...")
         
-        # Use BERT if available, otherwise use improved K-Means
-        if self.use_fallback_clustering:
-            return self._classify_with_improved_kmeans()
-        else:
+        # Try BERT, fallback on any error
+        try:
             return self._classify_with_bert()
+        except Exception as e:
+            print(f"BERT processing failed: {e}")
+            print("Falling back to improved K-Means...")
+            return self._classify_with_improved_kmeans()
     
     def _classify_with_improved_kmeans(self):
         """Fallback: Improved K-Means with better features"""
