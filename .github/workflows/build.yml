@@ -1,7 +1,9 @@
-name: Build Email Organizer
+name: Build Email Organizer with BERT
 
 on:
   push:
+    branches: [ main ]
+  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
@@ -10,38 +12,47 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v3
     
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v4
       with:
         python-version: '3.10'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
         pip install pyinstaller
+        pip install -r requirements.txt
     
-    - name: Build executable
+    - name: Verify BERT installation
       run: |
-        pyinstaller --onefile --windowed --name EmailOrganizer --icon=NONE email_sorter.py
+        python -c "from sentence_transformers import SentenceTransformer; print('BERT OK')"
+        python -c "import torch; print(f'PyTorch {torch.__version__} OK')"
     
-    - name: Upload executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: EmailOrganizer-Windows
-        path: dist/EmailOrganizer.exe
+    - name: Build executable (folder mode for BERT)
+      run: |
+        pyinstaller --onedir --windowed --name EmailOrganizer ^
+          --icon=NONE ^
+          --add-data "README.md;." ^
+          --hidden-import=sentence_transformers ^
+          --hidden-import=torch ^
+          --hidden-import=numpy ^
+          --hidden-import=sklearn ^
+          --hidden-import=openpyxl ^
+          --hidden-import=extract_msg ^
+          --collect-all sentence_transformers ^
+          --collect-all torch ^
+          --collect-all transformers ^
+          email_sorter.py
     
-    - name: Create Release
-      if: github.ref == 'refs/heads/main'
-      uses: softprops/action-gh-release@v1
+    - name: Create portable package
+      run: |
+        cd dist
+        Compress-Archive -Path EmailOrganizer -DestinationPath EmailOrganizer-BERT-Windows.zip
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
       with:
-        files: dist/EmailOrganizer.exe
-        tag_name: v1.0.${{ github.run_number }}
-        name: Email Organizer v1.0.${{ github.run_number }}
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: EmailOrganizer-BERT-Windows
+        path: dist/EmailOrganizer-BERT-Windows.zip
