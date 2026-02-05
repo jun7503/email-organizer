@@ -1,15 +1,7 @@
-# Requirements for Email Organizer with BERT
-# CORRECTED PyTorch versions for Windows compatibility
-
 openpyxl==3.1.2
 scikit-learn==1.3.2
 numpy==1.24.3
 extract-msg==0.41.1
-
-# PyTorch CPU-only (most compatible for Windows)
---index-url https://download.pytorch.org/whl/cpu
 torch==2.0.1
-torchvision==0.15.2
-
-# Sentence transformers (BERT)
 sentence-transformers==2.2.2
+transformers==4.35.0
