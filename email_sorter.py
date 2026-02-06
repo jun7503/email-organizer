@@ -1,9 +1,16 @@
+# -*- coding: utf-8 -*-
 """
-Email Topic Organizer with Local BERT
-- Smart AI grouping with 85-90% accuracy
-- Learn from your Excel corrections
-- Detect topic keywords in email body
-- Multi-language support (Korean, English, French)
+email_sorter.py — Email Topic Organizer with Local BERT (Patched v2)
+
+Key features
+- Smart AI grouping with cosine confidence & auto-K (silhouette, with safe fallback)
+- Learn from your Excel corrections (centroid persistence, per-Excel state path)
+- TopicMap: “Merge Into” + “Custom Name” applied to learned centroids and final labels
+- Multi-language (KO/EN/FR) using multilingual SentenceTransformer
+- Clean, line-by-line Conversation Summary & Body Preview:
+  Sender <email> | Monday, February 2, 2026 5:28 PM | key sentence (greetings removed)
+- Message ID in Emails sheet (for robust learning & overrides)
+- Safer exception handling (no bare `except:`), and neutral UI wording
 """
 
 import tkinter as tk
@@ -18,7 +25,6 @@ from email import policy
 from email.parser import BytesParser
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
 import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,72 +33,129 @@ warnings.filterwarnings('ignore')
 class EmailOrganizer:
     def __init__(self):
         self.emails = []
-        self.excel_path = None
+        self.excel_path = None  # GUI sets this when you choose an Excel file
+        self.state_path = None  # <ExcelName>.learning_state.json (per-Excel)
         self.bert_model = None
-        self.use_fallback_clustering = False  # Fallback to improved K-Means if BERT fails
-        self.correction_memory = {}  # Store user corrections
-        self.topic_keywords = {}  # Store topic keywords found in emails
-        
+        self.use_fallback_clustering = False
+        self.correction_memory = {}              # by Message ID
+        self.correction_memory_by_subject = {}   # by Subject
+        self.topic_keywords = {}
+        self.min_confidence = 0.65
+        self.topicmap_rules = {}                 # {orig: {name: str, merge: str}}
+
+    # ---------------------- Utilities: formatting & helpers ----------------------
+    def _strip_greetings(self, text: str) -> str:
+        """Remove typical greetings/boilerplate and return first meaningful sentence."""
+        if not isinstance(text, str):
+            return ""
+        t = text.replace("\r\n", "\n").replace("\r", "\n")
+        GREET_PREFIXES = (
+            "안녕하세요", "안녕하십니까", "좋은 하루", "수고하십니다",
+            "Hello", "Hi", "Dear", "Good morning", "Good afternoon", "Good evening",
+            "Bonjour", "Bonsoir", "Salut",
+        )
+        JUNK_PREFIXES = (
+            "주의", "CAUTION", "From:", "De :", "Sent:", "Envoyé", "Subject:", "Sujet:", "To:", "Cc:", "Date:"
+        )
+        lines = []
+        for raw in t.split("\n"):
+            ln = " ".join(raw.strip().split())
+            if not ln:
+                if lines and lines[-1] == "":
+                    continue
+                lines.append("")
+                continue
+            if any(ln.startswith(p) for p in JUNK_PREFIXES):
+                continue
+            low = ln.lower()
+            if any(low.startswith(p.lower()) for p in GREET_PREFIXES):
+                if len(ln) <= 20:
+                    continue
+                for p in GREET_PREFIXES:
+                    if low.startswith(p.lower()):
+                        ln = ln[len(p):].lstrip(" ,:—-")
+                        break
+            lines.append(ln)
+        for ln in lines:
+            if ln:
+                return ln
+        return ""
+
+    def _format_sender_date_keyword(self, sender: str, date_str: str, key_sentence: str) -> str:
+        s = (sender or "").strip()
+        d = (date_str or "").strip()
+        k = (key_sentence or "").strip()
+        parts = [p for p in (s, d, k) if p]
+        line = " | ".join(parts)
+        return " ".join(line.split())[:1000]
+
+    def _to_single_spaced_lines(self, text: str, max_lines: int = None, max_chars: int = None) -> str:
+        if not isinstance(text, str):
+            return ""
+        t = text.replace("\r\n", "\n").replace("\r", "\n")
+        out = []
+        for raw in t.split("\n"):
+            ln = " ".join(raw.strip().split())
+            if ln == "":
+                if out and out[-1] == "":
+                    continue
+            out.append(ln)
+        if max_lines is not None and len(out) > max_lines:
+            out = out[:max_lines]
+        res = "\n".join(out)
+        if max_chars is not None and len(res) > max_chars:
+            res = res[:max_chars]
+        return res
+
+    def _state_path_for_excel(self, excel_path: str) -> Path:
+        p = Path(excel_path)
+        return p.with_name(f"{p.stem}.learning_state.json")
+
+    # ---------------------- BERT init ----------------------
     def initialize_bert(self):
-        """Initialize BERT model (downloads on first use)"""
         try:
-            # Optimize for multi-core CPUs
             import torch
-            import os
-            
-            # Use all available CPU cores
             num_cores = os.cpu_count() or 4
             torch.set_num_threads(num_cores)
-            print(f"Using {num_cores} CPU threads for BERT")
-            
             from sentence_transformers import SentenceTransformer
-            print("Loading BERT model (first time may take 2-3 minutes)...")
-            
-            # Try to load the model
             try:
                 self.bert_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-                print("BERT model loaded successfully!")
                 return True
             except AttributeError as e:
-                # PyTorch compatibility issue - try alternative model
-                print(f"Primary model failed: {e}")
-                print("Trying alternative model...")
+                print(f"Primary model failed: {e}\nTrying alternative model...")
                 try:
                     self.bert_model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
-                    print("Alternative BERT model loaded successfully!")
                     return True
                 except Exception as e2:
-                    print(f"Alternative model also failed: {e2}")
+                    print(f"Alternative model failed: {e2}")
                     raise
-                    
         except ImportError:
-            messagebox.showerror("Missing Library", 
-                "sentence-transformers library not found!\n\n"
-                "Please install: pip install sentence-transformers torch")
+            messagebox.showerror(
+                "Missing Library",
+                "sentence-transformers not found.\nInstall: pip install sentence-transformers torch"
+            )
             return False
         except Exception as e:
             import traceback
-            error_msg = traceback.format_exc()
-            print(f"Error loading BERT:\n{error_msg}")
-            
-            # Offer fallback to improved K-Means
-            response = messagebox.askyesno("BERT Loading Error", 
-                f"Could not load BERT model:\n{str(e)}\n\n"
-                "This is likely a PyTorch compatibility issue.\n\n"
-                "Would you like to:\n"
-                "YES = Use improved K-Means (75-80% accuracy, works now)\n"
-                "NO = Cancel and fix BERT installation\n\n"
-                "Recommended: Click YES to proceed with good accuracy.")
-            
+            print("Error loading BERT:\n" + traceback.format_exc())
+            response = messagebox.askyesno(
+                "BERT Loading Error",
+                "Could not load BERT (likely PyTorch issue).\n\n"
+                "YES = Use improved K-Means (works now)\n"
+                "NO  = Cancel and fix BERT installation"
+            )
             if response:
-                print("Using fallback: Improved K-Means")
                 self.use_fallback_clustering = True
                 return True
-            else:
-                return False
-    
+            return False
+
+    def _ensure_bert(self):
+        if not self.bert_model:
+            if not self.initialize_bert():
+                raise RuntimeError("BERT not available and fallback not allowed for learning.")
+
+    # ---------------------- Parsing ----------------------
     def parse_email_file(self, filepath):
-        """Parse .eml or .msg file"""
         try:
             if filepath.lower().endswith('.eml'):
                 return self._parse_eml(filepath)
@@ -106,37 +169,27 @@ class EmailOrganizer:
             import traceback
             traceback.print_exc()
             return None
-    
+
     def _parse_eml(self, filepath):
-        """Parse .eml file"""
         with open(filepath, 'rb') as f:
             msg = BytesParser(policy=policy.default).parse(f)
-        
         subject = msg.get('Subject', 'No Subject')
         from_addr = msg.get('From', 'Unknown')
         date_str = msg.get('Date', '')
-        
         try:
-            if date_str:
-                date_obj = email.utils.parsedate_to_datetime(date_str)
-            else:
-                date_obj = datetime.now()
-        except:
+            date_obj = email.utils.parsedate_to_datetime(date_str) if date_str else datetime.now()
+        except Exception:
             date_obj = datetime.now()
-        
         body = self._extract_body_eml(msg)
-        
-        # Detect topic keywords in body
         topic_keyword = self._extract_topic_keyword(subject, body)
-        
         thread_info = self._parse_conversation_thread(body)
-        
         content_for_hash = f"{subject}{from_addr}{body[:500]}"
         msg_id = msg.get('Message-ID', hashlib.md5(content_for_hash.encode()).hexdigest())
-        
         issue = self._extract_marker(subject + ' ' + body, r'(?i)(issue|bug|problem)\s*[:#]?\s*(\w+)')
         milestone = self._extract_marker(subject + ' ' + body, r'(?i)(milestone|phase|sprint)\s*[:#]?\s*(\w+)')
-        
+        pretty_date = date_obj.strftime("%A, %B %d, %Y %I:%M %p")
+        key_sentence = self._strip_greetings(body if body else subject)
+        body_preview_line = self._format_sender_date_keyword(from_addr, pretty_date, key_sentence)
         return {
             'message_id': msg_id,
             'subject': subject,
@@ -149,19 +202,16 @@ class EmailOrganizer:
             'thread_count': thread_info['count'],
             'thread_summary': thread_info['summary'],
             'conversation_dates': thread_info['dates'],
-            'topic_keyword': topic_keyword  # NEW: Topic keyword from body
+            'topic_keyword': topic_keyword,
+            'body_preview_line': body_preview_line,
         }
-    
+
     def _parse_msg(self, filepath):
-        """Parse .msg file using extract-msg library"""
         try:
             import extract_msg
-            
             msg = extract_msg.Message(filepath)
-            
             subject = msg.subject or 'No Subject'
             from_addr = msg.sender or 'Unknown'
-            
             try:
                 date_obj = msg.date
                 if date_obj is None:
@@ -169,31 +219,26 @@ class EmailOrganizer:
                 elif isinstance(date_obj, str):
                     try:
                         date_obj = datetime.strptime(date_obj, '%a, %d %b %Y %H:%M:%S %z')
-                    except:
+                    except Exception:
                         try:
                             date_obj = datetime.strptime(date_obj, '%Y-%m-%d %H:%M:%S')
-                        except:
+                        except Exception:
                             date_obj = datetime.now()
-            except:
+            except Exception:
                 date_obj = datetime.now()
-            
             body = msg.body or ''
             if not body:
                 body = msg.htmlBody or ''
-            
-            # Detect topic keywords in body
             topic_keyword = self._extract_topic_keyword(subject, body)
-            
             thread_info = self._parse_conversation_thread(body)
-            
             content_for_hash = f"{subject}{from_addr}{body[:500]}"
             msg_id = msg.messageId or hashlib.md5(content_for_hash.encode()).hexdigest()
-            
             issue = self._extract_marker(subject + ' ' + body, r'(?i)(issue|bug|problem)\s*[:#]?\s*(\w+)')
             milestone = self._extract_marker(subject + ' ' + body, r'(?i)(milestone|phase|sprint)\s*[:#]?\s*(\w+)')
-            
+            pretty_date = date_obj.strftime("%A, %B %d, %Y %I:%M %p")
+            key_sentence = self._strip_greetings(body if body else subject)
+            body_preview_line = self._format_sender_date_keyword(from_addr, pretty_date, key_sentence)
             msg.close()
-            
             return {
                 'message_id': msg_id,
                 'subject': subject,
@@ -206,734 +251,617 @@ class EmailOrganizer:
                 'thread_count': thread_info['count'],
                 'thread_summary': thread_info['summary'],
                 'conversation_dates': thread_info['dates'],
-                'topic_keyword': topic_keyword  # NEW: Topic keyword from body
+                'topic_keyword': topic_keyword,
+                'body_preview_line': body_preview_line,
             }
-            
         except ImportError:
             raise Exception("extract-msg library is required for .msg files.")
         except Exception as e:
             print(f"Error parsing MSG file {filepath}: {e}")
             raise
-    
+
     def _extract_topic_keyword(self, subject, body):
-        """
-        Extract topic keyword from email body
-        Looks for patterns like: "Topic: Purchase", "Topic: Technical", etc.
-        """
-        # Combine subject and body for searching
         full_text = f"{subject}\n{body}"
-        
-        # Pattern 1: "Topic: XYZ" or "Topic : XYZ"
         pattern1 = r'Topic\s*[:：]\s*([^\n\r,\.;]+)'
-        
-        # Pattern 2: "Topic - XYZ"
         pattern2 = r'Topic\s*[-–—]\s*([^\n\r,\.;]+)'
-        
-        # Pattern 3: "主题：XYZ" (Chinese/Korean)
         pattern3 = r'[主主题題]题?\s*[:：]\s*([^\n\r,\.;]+)'
-        
-        for pattern in [pattern1, pattern2, pattern3]:
-            match = re.search(pattern, full_text, re.IGNORECASE)
-            if match:
-                keyword = match.group(1).strip()
-                # Clean up the keyword
-                keyword = keyword[:50]  # Limit length
-                keyword = re.sub(r'\s+', ' ', keyword)  # Normalize whitespace
-                if len(keyword) > 2:  # Must be meaningful
+        for pattern in (pattern1, pattern2, pattern3):
+            m = re.search(pattern, full_text, re.IGNORECASE)
+            if m:
+                keyword = m.group(1).strip()[:50]
+                keyword = re.sub(r'\s+', ' ', keyword)
+                if len(keyword) > 2:
                     return keyword
-        
-        return ''  # No topic keyword found
-    
+        return ''
+
     def _extract_body_eml(self, msg):
-        """Extract email body text from EML"""
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
                 if part.get_content_type() == "text/plain":
                     try:
                         body += part.get_content()
-                    except:
+                    except Exception:
                         pass
         else:
             try:
                 body = msg.get_content()
-            except:
+            except Exception:
                 body = str(msg)
-        
         return body
-    
+
     def _parse_conversation_thread(self, body_text):
-        """Parse email body to detect conversation threads"""
         if not body_text:
             return {'count': 1, 'summary': '', 'dates': []}
-        
-        from_pattern = r'From:\s*([^\r\n]+)'
-        sent_pattern = r'Sent:\s*([^\r\n]+)'
-        date_pattern = r'Date:\s*([^\r\n]+)'
-        
-        from_matches = re.findall(from_pattern, body_text)
-        sent_matches = re.findall(sent_pattern, body_text)
-        date_matches = re.findall(date_pattern, body_text)
-        
-        thread_count = max(len(from_matches), len(sent_matches), 1)
-        
-        conversation_dates = []
-        for date_str in (sent_matches + date_matches):
-            try:
-                parsed_date = self._parse_flexible_date(date_str)
-                if parsed_date:
-                    conversation_dates.append(parsed_date)
-            except:
-                pass
-        
-        summary = self._extract_conversation_summary(body_text, thread_count)
-        
-        return {
-            'count': thread_count,
-            'summary': summary,
-            'dates': sorted(set(conversation_dates))
-        }
-    
+        t = body_text.replace("\r\n", "\n").replace("\r", "\n")
+        sections = re.split(r'(?i)(?:^|\n)(?:From:|De :|发件人:|보낸 사람:|-----Original Message-----)', t)
+        entries, dates_collected = [], []
+        hdr_from = re.compile(r'(?i)^From:\s*(.+)')
+        hdr_date = re.compile(r'(?i)^(?:Date|Sent|Envoyé|보낸 날짜|날짜):\s*(.+)')
+        for sec in sections:
+            sec = sec.strip()
+            if not sec:
+                continue
+            sender_line = ""; date_line = ""
+            lines = sec.split("\n")
+            for ln in lines[:20]:
+                l = " ".join(ln.strip().split())
+                if not l:
+                    continue
+                m_from = hdr_from.match(l)
+                if m_from and not sender_line:
+                    sender_line = m_from.group(1).strip()
+                    continue
+                m_date = hdr_date.match(l)
+                if m_date and not date_line:
+                    date_line = m_date.group(1).strip()
+                    try:
+                        parsed = self._parse_flexible_date(date_line)
+                        if parsed:
+                            dates_collected.append(parsed)
+                            date_line = parsed.strftime("%A, %B %d, %Y %I:%M %p")
+                    except Exception:
+                        pass
+            key_sentence = self._strip_greetings(sec)
+            if key_sentence or sender_line or date_line:
+                entries.append(self._format_sender_date_keyword(sender_line, date_line, key_sentence))
+        if not entries:
+            single = self._strip_greetings(t)
+            if single:
+                entries.append(self._format_sender_date_keyword("", "", single))
+        summary_text = self._to_single_spaced_lines("\n".join(entries), max_lines=10, max_chars=1500)
+        return {'count': max(1, len(entries)), 'summary': summary_text, 'dates': sorted(set(dates_collected))}
+
     def _parse_flexible_date(self, date_str):
-        """Try to parse date from various formats"""
-        date_formats = [
-            '%m/%d/%Y %I:%M:%S %p',
-            '%m/%d/%Y %I:%M %p',
-            '%d/%m/%Y %H:%M:%S',
-            '%Y-%m-%d %H:%M:%S',
-            '%a, %d %b %Y %H:%M:%S',
-            '%B %d, %Y %I:%M %p',
+        formats = [
+            '%m/%d/%Y %I:%M:%S %p', '%m/%d/%Y %I:%M %p', '%d/%m/%Y %H:%M:%S',
+            '%Y-%m-%d %H:%M:%S', '%a, %d %b %Y %H:%M:%S', '%B %d, %Y %I:%M %p',
         ]
-        
-        for fmt in date_formats:
+        for fmt in formats:
             try:
                 return datetime.strptime(date_str.strip(), fmt)
-            except:
+            except Exception:
                 continue
         return None
-    
+
     def _extract_conversation_summary(self, body_text, thread_count):
-        """Extract key points from conversation thread"""
+        # Deprecated but kept for compatibility
         if thread_count <= 1:
             lines = body_text.split('\n')
-            meaningful_lines = [line.strip() for line in lines 
-                              if len(line.strip()) > 20 and not line.strip().startswith('>')]
-            return ' '.join(meaningful_lines[:3])[:300]
-        
+            meaningful = [ln.strip() for ln in lines if len(ln.strip()) > 20 and not ln.strip().startswith('>')]
+            base = ' '.join(meaningful[:3])[:300]
+            return self._to_single_spaced_lines(base, max_lines=3, max_chars=300)
         summary_parts = []
         sections = re.split(r'_{5,}|From:|Sent:|Original Message', body_text, flags=re.IGNORECASE)
-        
         for section in sections[:5]:
             lines = section.split('\n')
             content_lines = []
             for line in lines:
-                clean_line = line.strip()
-                if (len(clean_line) > 30 and 
-                    not clean_line.startswith('>') and
+                clean_line = " ".join(line.strip().split())
+                if (
+                    len(clean_line) > 30 and not clean_line.startswith('>') and
                     not clean_line.startswith('-----') and
-                    not any(header in clean_line for header in ['Subject:', 'To:', 'Cc:', 'Date:', 'From:'])):
+                    not any(h in clean_line for h in ['Subject:', 'To:', 'Cc:', 'Date:', 'From:'])
+                ):
                     content_lines.append(clean_line)
                     if len(content_lines) >= 2:
                         break
-            
             if content_lines:
                 summary_parts.extend(content_lines)
-        
         full_summary = ' | '.join(summary_parts)
-        return full_summary[:500] if full_summary else 'Conversation thread'
-    
+        return self._to_single_spaced_lines(full_summary or 'Conversation thread', max_lines=10, max_chars=500)
+
     def _extract_marker(self, text, pattern):
-        """Extract issue or milestone markers"""
-        match = re.search(pattern, text)
-        if match:
-            return match.group(0)
-        return ''
-    
+        m = re.search(pattern, text)
+        return m.group(0) if m else ''
+
+    # ---------------------- Classification ----------------------
     def classify_topics_with_bert(self):
-        """Classify emails using BERT embeddings or fallback to improved K-Means"""
-        # Check if we should use fallback
         if self.use_fallback_clustering:
             print("Using improved K-Means (user selected fallback)")
             return self._classify_with_improved_kmeans()
-        
-        # Try to initialize BERT if not already done
         if not self.bert_model:
             if not self.initialize_bert():
-                # initialize_bert may have set use_fallback_clustering
                 if self.use_fallback_clustering:
                     return self._classify_with_improved_kmeans()
-                else:
-                    return False
-        
+                return False
         if len(self.emails) < 2:
-            for email_data in self.emails:
-                email_data['topic'] = 'Topic_1'
-                email_data['confidence'] = 1.0
+            for e in self.emails:
+                e['topic'] = 'Topic_1'; e['confidence'] = 1.0
             return True
-        
-        print(f"Processing {len(self.emails)} emails with BERT...")
-        
-        # Try BERT, fallback on any error
         try:
             return self._classify_with_bert()
         except Exception as e:
             print(f"BERT processing failed: {e}")
             print("Falling back to improved K-Means...")
             return self._classify_with_improved_kmeans()
-    
+
     def _classify_with_improved_kmeans(self):
-        """Fallback: Improved K-Means with better features"""
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.cluster import KMeans
-        
-        print("Using improved K-Means (no BERT needed)...")
-        
-        # Prepare texts with better weighting
         texts = []
         for e in self.emails:
-            # Weight subject more, include topic keyword
-            topic_hint = f" {e.get('topic_keyword', '')}" * 3 if e.get('topic_keyword') else ""
-            text = f"{e['subject']} {e['subject']} {e['subject']}{topic_hint} {e['body'][:1000]}"
-            texts.append(text)
-        
-        # Use TF-IDF instead of hashing (better for small datasets)
-        vectorizer = TfidfVectorizer(
-            max_features=500,  # More features than before
-            stop_words='english',
-            ngram_range=(1, 2),
-            min_df=1,
-            max_df=0.95
-        )
-        
+            topic_hint = (" " + e.get('topic_keyword', '')) * 3 if e.get('topic_keyword') else ""
+            body_clean = self._strip_greetings(e.get('body', '')[:1500])
+            texts.append(f"{e['subject']} {e['subject']} {e['subject']}{topic_hint} {body_clean}")
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words='english', ngram_range=(1, 2), min_df=1, max_df=0.95)
         vectors = vectorizer.fit_transform(texts)
-        
-        # Cluster
         n_clusters = min(5, max(2, len(self.emails) // 5))
-        print(f"Clustering into {n_clusters} topics...")
-        
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = kmeans.fit_predict(vectors)
-        
-        # Calculate confidence
         distances = kmeans.transform(vectors)
-        
-        for i, email_data in enumerate(self.emails):
-            email_data['topic'] = f'Topic_{labels[i] + 1}'
-            
+        for i, e in enumerate(self.emails):
+            e['topic'] = f'Topic_{labels[i] + 1}'
             min_dist = distances[i][labels[i]]
             second_min_dist = np.partition(distances[i], 1)[1]
-            confidence = 1 - (min_dist / (min_dist + second_min_dist + 0.001))
-            email_data['confidence'] = round(confidence, 2)
-        
-        # Apply topic keywords and corrections
+            e['confidence'] = round(1 - (min_dist / (min_dist + second_min_dist + 0.001)), 2)
         self._apply_topic_keywords()
         self._apply_correction_memory()
-        
-        print("Classification complete! (Improved K-Means: 75-80% accuracy)")
+        self._apply_topicmap_to_emails()  # apply merges/renames for display
+        print("Classification complete! (Improved K-Means)")
         return True
-    
+
     def _classify_with_bert(self):
-        """Use BERT embeddings for classification"""
         print("Processing with BERT AI...")
-        
-        # Prepare texts for BERT
         texts = []
         for e in self.emails:
-            # Include topic keyword if found
             topic_hint = f" Topic: {e.get('topic_keyword', '')}" if e.get('topic_keyword') else ""
-            text = f"{e['subject']} {e['subject']} {e['body'][:1000]}{topic_hint}"
-            texts.append(text)
-        
-        # Get BERT embeddings with progress
-        print("Generating semantic embeddings...")
+            clean_body = self._clean_for_embedding(e.get('body', '')[:1500])
+            texts.append(f"{e['subject']} {e['subject']} {clean_body}{topic_hint}")
+        print("Generating semantic embeddings (this may take a moment)...")
         try:
-            # Set timeout for slow systems
-            import sys
-            if len(texts) > 50:
-                print(f"Warning: Processing {len(texts)} emails may take several minutes...")
-            
-            embeddings = self.bert_model.encode(
-                texts, 
-                show_progress_bar=False,  # Disable tqdm progress (causes issues in GUI)
-                convert_to_numpy=True,
-                batch_size=8  # Smaller batches for stability
-            )
-            print(f"Generated embeddings for {len(texts)} emails")
-            
+            from sklearn.preprocessing import normalize
+            embeddings = self.bert_model.encode(texts, show_progress_bar=False, convert_to_numpy=True, batch_size=8)
+            embeddings = normalize(embeddings)
         except Exception as e:
             print(f"BERT encoding failed: {e}")
-            print("Falling back to improved K-Means...")
             return self._classify_with_improved_kmeans()
-        
-        # Cluster using K-Means
         from sklearn.cluster import KMeans
-        n_clusters = min(5, max(2, len(self.emails) // 5))
-        
-        print(f"Clustering into {n_clusters} topics...")
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(embeddings)
-        
-        # Calculate confidence scores
-        distances = kmeans.transform(embeddings)
-        
-        for i, email_data in enumerate(self.emails):
-            email_data['topic'] = f'Topic_{labels[i] + 1}'
-            
-            # Confidence = inverse of distance to cluster center
-            min_dist = distances[i][labels[i]]
-            second_min_dist = np.partition(distances[i], 1)[1]
-            confidence = 1 - (min_dist / (min_dist + second_min_dist + 0.001))
-            email_data['confidence'] = round(confidence, 2)
-            
-            # Store embedding for future learning
-            email_data['embedding'] = embeddings[i]
-        
-        # Apply topic keywords to override AI when specified
+        n_min, n_max = 2, min(10, max(3, len(self.emails)//2))
+        candidates = list(range(n_min, n_max + 1))
+        best_model = None
+        try:
+            from sklearn.metrics import silhouette_score
+            best_score = -1
+            for k in candidates:
+                km = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labs = km.fit_predict(embeddings)
+                score = silhouette_score(embeddings, labs, metric='euclidean')
+                if score > best_score:
+                    best_score, best_model = score, km
+        except Exception:
+            k = min(5, max(2, len(self.emails)//5))
+            best_model = KMeans(n_clusters=k, random_state=42, n_init=10).fit(embeddings)
+        labels = best_model.labels_
+        from sklearn.preprocessing import normalize
+        centroids = normalize(best_model.cluster_centers_)
+        for i, e in enumerate(self.emails):
+            e['topic'] = f'Topic_{labels[i] + 1}'
+            e['confidence'] = round(float(np.dot(embeddings[i], centroids[labels[i]])), 2)
+            e['embedding'] = embeddings[i]
+        for e in self.emails:
+            if e.get('confidence', 0) < self.min_confidence:
+                e['topic'] = 'Uncertain'
+        # Load learned centroids from per-Excel state (then fallback global)
+        self._apply_learned_topics_to_embeddings(embeddings, min_conf=self.min_confidence)
         self._apply_topic_keywords()
-        
-        # Apply correction memory
         self._apply_correction_memory()
-        
-        print("Classification complete! (BERT: 85-90% accuracy)")
+        self._apply_topicmap_to_emails()  # apply merges/renames for display
+        print("Classification complete! (BERT)")
         return True
-    
-    def _apply_topic_keywords(self):
-        """
-        If user specified topic keyword in email body,
-        group all emails with same keyword together
-        """
-        keyword_to_topic = {}
-        
-        # First pass: collect all topic keywords
-        for email_data in self.emails:
-            keyword = email_data.get('topic_keyword', '').lower().strip()
-            if keyword:
-                if keyword not in keyword_to_topic:
-                    keyword_to_topic[keyword] = email_data['topic']
-                self.topic_keywords[keyword] = email_data['topic']
-        
-        # Second pass: apply consistent topics for same keywords
-        for email_data in self.emails:
-            keyword = email_data.get('topic_keyword', '').lower().strip()
-            if keyword and keyword in keyword_to_topic:
-                email_data['topic'] = keyword_to_topic[keyword]
-                email_data['confidence'] = 1.0  # High confidence - user specified!
-    
-    def _apply_correction_memory(self):
-        """Apply previous user corrections to similar emails"""
-        if not self.correction_memory:
+
+    def _apply_learned_topics_to_embeddings(self, embeddings, min_conf=0.65):
+        import json
+        state_paths = []
+        if self.excel_path:
+            state_paths.append(self._state_path_for_excel(self.excel_path))
+        state_paths.append(Path('learning_state.json'))  # fallback for backward compatibility
+        state = None
+        for p in state_paths:
+            try:
+                if Path(p).exists():
+                    with open(p, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                        break
+            except Exception as e:
+                print(f"Could not read state from {p}: {e}")
+        if not state or not state.get('topics'):
             return
-        
-        for email_data in self.emails:
-            msg_id = email_data['message_id']
-            
-            # Check if this exact email was corrected before
-            if msg_id in self.correction_memory:
-                correction = self.correction_memory[msg_id]
-                email_data['topic'] = correction['corrected_topic']
-                email_data['confidence'] = 0.99  # Very high - user corrected!
-    
+        from sklearn.preprocessing import normalize
+        topic_names = list(state['topics'].keys())
+        C = np.vstack([np.array(state['topics'][t]) for t in topic_names])
+        E = normalize(np.asarray(embeddings))
+        sims = E @ C.T
+        for i, e in enumerate(self.emails):
+            best_idx = int(np.argmax(sims[i])); best_sim = float(sims[i, best_idx])
+            if best_sim >= state.get('min_confidence', min_conf):
+                e['topic'] = topic_names[best_idx]
+                e['confidence'] = round(best_sim, 2)
+
+    # ---------------------- Topic keywords & corrections ----------------------
+    def _apply_topic_keywords(self):
+        keyword_to_topic = {}
+        for e in self.emails:
+            kw = (e.get('topic_keyword', '') or '').lower().strip()
+            if kw:
+                if kw not in keyword_to_topic:
+                    keyword_to_topic[kw] = e['topic']
+                self.topic_keywords[kw] = e['topic']
+        for e in self.emails:
+            kw = (e.get('topic_keyword', '') or '').lower().strip()
+            if kw and kw in keyword_to_topic:
+                e['topic'] = keyword_to_topic[kw]
+                e['confidence'] = 1.0
+
+    def _apply_correction_memory(self):
+        if not (self.correction_memory or self.correction_memory_by_subject):
+            return
+        for e in self.emails:
+            mid = str(e.get('message_id', '')).strip()
+            subj = (e.get('subject') or '').strip().lower()
+            if mid and mid in self.correction_memory:
+                corr = self.correction_memory[mid]
+                e['topic'] = corr['corrected_topic']; e['confidence'] = 0.99
+                continue
+            if subj and subj in self.correction_memory_by_subject:
+                corr = self.correction_memory_by_subject[subj]
+                e['topic'] = corr['corrected_topic']; e['confidence'] = 0.98
+
+    # ---------------------- TopicMap (Merge Into + Rename) ----------------------
+    def _apply_topicmap_to_emails(self):
+        if not self.topicmap_rules:
+            return
+        def resolve(topic: str) -> str:
+            visited = set(); cur = topic
+            while cur in self.topicmap_rules and self.topicmap_rules[cur].get('merge'):
+                if cur in visited: break
+                visited.add(cur)
+                cur = self.topicmap_rules[cur]['merge']
+            custom = self.topicmap_rules.get(cur, {}).get('name') or self.topicmap_rules.get(topic, {}).get('name')
+            return custom or cur
+        for e in self.emails:
+            e['topic'] = resolve(e['topic'])
+
+    # ---------------------- Excel I/O ----------------------
     def load_existing_excel(self, filepath):
-        """Load existing Excel file to check for duplicates and corrections"""
         processed_ids = set()
-        
         if not os.path.exists(filepath):
             return processed_ids
-        
         try:
             wb = openpyxl.load_workbook(filepath)
-            
-            # Load processed IDs
             if 'Index' in wb.sheetnames:
                 ws = wb['Index']
                 for row in ws.iter_rows(min_row=2, values_only=True):
                     if row[0]:
-                        msg_id = str(row[0]).strip()
-                        processed_ids.add(msg_id)
-            
-            # Load user corrections
+                        processed_ids.add(str(row[0]).strip())
             if 'Corrections' in wb.sheetnames:
                 ws = wb['Corrections']
                 for row in ws.iter_rows(min_row=2, values_only=True):
-                    if row[0] and row[2]:  # message_id and corrected_topic
-                        msg_id = str(row[0]).strip()
-                        ai_topic = row[1]
-                        corrected_topic = row[2]
-                        self.correction_memory[msg_id] = {
-                            'ai_topic': ai_topic,
-                            'corrected_topic': corrected_topic
-                        }
-                print(f"Loaded {len(self.correction_memory)} user corrections")
-            
+                    mid = (row[0] or "").strip() if row[0] else ""
+                    ai_topic = (row[1] or "").strip() if row[1] else ""
+                    corrected = (row[2] or "").strip() if row[2] else ""
+                    subj = (row[4] or "").strip().lower() if len(row) > 4 and row[4] else ""
+                    if corrected:
+                        if mid:
+                            self.correction_memory[mid] = {'ai_topic': ai_topic, 'corrected_topic': corrected}
+                        if subj:
+                            self.correction_memory_by_subject[subj] = {'ai_topic': ai_topic, 'corrected_topic': corrected}
+            # TopicMap rules
+            self.topicmap_rules = {}
+            if 'TopicMap' in wb.sheetnames:
+                ws = wb['TopicMap']
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if row[0]:
+                        orig = str(row[0]).strip()
+                        cname = (row[1] or '').strip()
+                        merge = (row[2] or '').strip()
+                        self.topicmap_rules[orig] = {'name': cname, 'merge': merge}
             wb.close()
         except Exception as e:
             print(f"Error loading existing Excel: {e}")
-        
         return processed_ids
-    
+
     def save_to_excel(self, filepath):
-        """Save emails to Excel with all required sheets"""
         if os.path.exists(filepath):
             wb = openpyxl.load_workbook(filepath)
         else:
-            wb = openpyxl.Workbook()
-            wb.remove(wb.active)
-        
-        # Ensure all sheets exist
-        required_sheets = ['Emails', 'Summary', 'TopicMap', 'Corrections', 'Index']
-        for sheet_name in required_sheets:
-            if sheet_name not in wb.sheetnames:
-                wb.create_sheet(sheet_name)
-        
+            wb = openpyxl.Workbook(); wb.remove(wb.active)
+        for name in ['Emails', 'Summary', 'TopicMap', 'Corrections', 'Index']:
+            if name not in wb.sheetnames:
+                wb.create_sheet(name)
         self._write_emails_sheet(wb['Emails'])
         self._write_summary_sheet(wb)
         self._write_topicmap_sheet(wb)
         self._write_corrections_sheet(wb['Corrections'])
         self._write_index_sheet(wb['Index'])
-        
-        wb.save(filepath)
-        wb.close()
-    
+        wb.save(filepath); wb.close()
+
     def _write_emails_sheet(self, ws):
-        """Append new emails to Emails sheet"""
         if ws.max_row == 1 or ws.cell(1, 1).value != 'Date':
-            headers = ['Date', 'Topic', 'Confidence', 'Topic Keyword', 'Subject', 'From', 
-                      'Thread Count', 'Conversation Summary', 'Issue', 'Milestone', 'Body Preview',
-                      'Correct Topic']  # NEW: User can fill this
-            ws.append(headers)
-            self._style_header(ws)
-        
-        for email_data in self.emails:
+            headers = ['Date', 'Topic', 'Confidence', 'Topic Keyword', 'Subject', 'From',
+                       'Thread Count', 'Conversation Summary', 'Issue', 'Milestone', 'Body Preview',
+                       'Correct Topic', 'Message ID']
+            ws.append(headers); self._style_header(ws)
+        for e in self.emails:
+            conv_summary = self._to_single_spaced_lines(e.get('thread_summary', '') or '', max_lines=10, max_chars=1500)
+            body_preview = e.get('body_preview_line') or self._format_sender_date_keyword(
+                e.get('from', ''), e.get('date').strftime("%A, %B %d, %Y %I:%M %p") if e.get('date') else '',
+                self._strip_greetings(e.get('body','') or e.get('subject',''))
+            )
+            body_preview = self._to_single_spaced_lines(body_preview, max_lines=5, max_chars=1000)
             ws.append([
-                email_data['date'].strftime('%Y-%m-%d %H:%M:%S'),
-                email_data['topic'],
-                email_data.get('confidence', 0.0),
-                email_data.get('topic_keyword', ''),
-                email_data['subject'],
-                email_data['from'],
-                email_data.get('thread_count', 1),
-                email_data.get('thread_summary', '')[:500],
-                email_data.get('issue', '') or '',
-                email_data.get('milestone', '') or '',
-                email_data['body'][:200] or '',
-                ''  # Correct Topic - user fills this
+                e['date'].strftime('%Y-%m-%d %H:%M:%S'), e['topic'], e.get('confidence', 0.0),
+                e.get('topic_keyword', ''), e['subject'], e['from'], e.get('thread_count', 1),
+                conv_summary, e.get('issue', '') or '', e.get('milestone', '') or '', body_preview, '',
+                str(e.get('message_id',''))
             ])
-        
         self._auto_adjust_columns(ws)
-    
+
     def _write_corrections_sheet(self, ws):
-        """Write/update corrections sheet where app learns from user"""
         if ws.max_row == 1 or ws.cell(1, 1).value != 'Message ID':
-            ws.append(['Message ID', 'AI Topic', 'Corrected Topic', 'Date Corrected', 'Subject'])
-            self._style_header(ws)
-        
-        # This sheet gets updated when user clicks "Learn from Excel" button
-        # For now, just ensure it exists
+            ws.append(['Message ID', 'AI Topic', 'Corrected Topic', 'Date Corrected', 'Subject']); self._style_header(ws)
         self._auto_adjust_columns(ws)
-    
+
     def _write_summary_sheet(self, wb):
-        """Regenerate Summary sheet with topic statistics"""
-        ws = wb['Summary']
-        ws.delete_rows(1, ws.max_row)
-        
+        ws = wb['Summary']; ws.delete_rows(1, ws.max_row)
         ws.append(['Topic', 'Count', 'Avg Confidence', 'Latest Date', 'Topic Keywords', 'Mapped Topic Name'])
         self._style_header(ws)
-        
-        emails_ws = wb['Emails']
-        topic_data = {}
-        
+        emails_ws = wb['Emails']; topic_data = {}
         for row in emails_ws.iter_rows(min_row=2, values_only=True):
-            if row[1]:  # Topic column
-                topic = row[1]
-                date_str = row[0]
-                confidence = row[2] if len(row) > 2 else 0.0
-                topic_keyword = row[3] if len(row) > 3 else ''
-                thread_count = row[6] if len(row) > 6 else 1
-                
-                if topic not in topic_data:
-                    topic_data[topic] = {
-                        'count': 0, 
-                        'latest': None, 
-                        'threads': 0,
-                        'confidences': [],
-                        'keywords': set()
-                    }
-                
-                topic_data[topic]['count'] += 1
-                topic_data[topic]['threads'] += thread_count
-                topic_data[topic]['confidences'].append(confidence)
-                if topic_keyword:
-                    topic_data[topic]['keywords'].add(topic_keyword)
-                
-                try:
-                    date_obj = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-                    if topic_data[topic]['latest'] is None or date_obj > topic_data[topic]['latest']:
-                        topic_data[topic]['latest'] = date_obj
-                except:
-                    pass
-        
+            if not row[1]:
+                continue
+            topic = row[1]; date_str = row[0]; conf = row[2] or 0.0; tkw = row[3] or ''; thr = row[6] or 1
+            if topic not in topic_data:
+                topic_data[topic] = {'count': 0, 'latest': None, 'threads': 0, 'confidences': [], 'keywords': set()}
+            topic_data[topic]['count'] += 1; topic_data[topic]['threads'] += thr; topic_data[topic]['confidences'].append(conf)
+            if tkw: topic_data[topic]['keywords'].add(tkw)
+            try:
+                d = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                if not topic_data[topic]['latest'] or d > topic_data[topic]['latest']:
+                    topic_data[topic]['latest'] = d
+            except Exception:
+                pass
+        # For display only: map to Custom Name column
         topicmap = self._get_topic_mappings(wb)
-        
         for topic in sorted(topic_data.keys()):
             latest = topic_data[topic]['latest']
             latest_str = latest.strftime('%Y-%m-%d %H:%M:%S') if latest else 'N/A'
             avg_conf = np.mean(topic_data[topic]['confidences']) if topic_data[topic]['confidences'] else 0
             keywords = ', '.join(sorted(topic_data[topic]['keywords']))
             mapped_name = topicmap.get(topic, '')
-            
-            ws.append([
-                topic,
-                topic_data[topic]['count'],
-                round(avg_conf, 2),
-                latest_str,
-                keywords,
-                mapped_name
-            ])
-        
+            ws.append([topic, topic_data[topic]['count'], round(avg_conf, 2), latest_str, keywords, mapped_name])
         self._auto_adjust_columns(ws)
-    
+
     def _write_topicmap_sheet(self, wb):
-        """Initialize or update TopicMap sheet with all topics"""
-        emails_ws = wb['Emails']
-        all_topics = set()
-        
+        emails_ws = wb['Emails']; all_topics = set()
         for row in emails_ws.iter_rows(min_row=2, values_only=True):
-            if row[1]:
-                all_topics.add(row[1])
-        
-        ws = wb['TopicMap']
-        existing_mappings = {}
-        
+            if row[1]: all_topics.add(row[1])
+        ws = wb['TopicMap']; existing = {}
         if ws.max_row > 1 and ws.cell(1, 1).value == 'Original Topic':
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[0]:
-                    existing_mappings[row[0]] = {
-                        'custom_name': row[1] or '',
-                        'merge_into': row[2] or ''
-                    }
-        
+                if row[0]: existing[row[0]] = {'custom_name': row[1] or '', 'merge_into': row[2] or ''}
         ws.delete_rows(1, ws.max_row)
-        ws.append(['Original Topic', 'Custom Name', 'Merge Into'])
-        self._style_header(ws)
-        
-        for topic in sorted(all_topics):
-            mapping = existing_mappings.get(topic, {'custom_name': '', 'merge_into': ''})
-            ws.append([topic, mapping['custom_name'], mapping['merge_into']])
-        
+        ws.append(['Original Topic', 'Custom Name', 'Merge Into']); self._style_header(ws)
+        for t in sorted(all_topics):
+            m = existing.get(t, {'custom_name': '', 'merge_into': ''})
+            ws.append([t, m['custom_name'], m['merge_into']])
         self._auto_adjust_columns(ws)
-    
+
     def _write_index_sheet(self, ws):
-        """Append processed email IDs to Index sheet"""
         if ws.max_row == 1 or ws.cell(1, 1).value != 'Message ID':
-            ws.append(['Message ID', 'Processed Date', 'Filename'])
-            self._style_header(ws)
-        
+            ws.append(['Message ID', 'Processed Date', 'Filename']); self._style_header(ws)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        for email_data in self.emails:
-            msg_id = str(email_data['message_id']).strip()
-            ws.append([
-                msg_id,
-                now,
-                Path(email_data['filepath']).name
-            ])
-        
+        for e in self.emails:
+            ws.append([str(e['message_id']).strip(), now, Path(e['filepath']).name])
         self._auto_adjust_columns(ws)
-    
+
     def _get_topic_mappings(self, wb):
-        """Get topic name mappings from TopicMap sheet"""
         mappings = {}
         if 'TopicMap' in wb.sheetnames:
             ws = wb['TopicMap']
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if row[0]:
-                    mappings[row[0]] = row[1] or ''
+                if row[0]: mappings[row[0]] = row[1] or ''
         return mappings
-    
+
     def _auto_adjust_columns(self, ws):
-        """Auto-adjust column widths for readability"""
         for column_cells in ws.columns:
-            length = 0
-            column = column_cells[0].column_letter
-            
+            length = 0; column = column_cells[0].column_letter
             for cell in column_cells:
                 try:
                     if cell.value:
-                        cell_length = len(str(cell.value))
-                        if cell_length > length:
-                            length = cell_length
-                except:
+                        length = max(length, len(str(cell.value)))
+                except Exception:
                     pass
-            
-            adjusted_width = min(max(length + 2, 10), 80)
-            ws.column_dimensions[column].width = adjusted_width
-    
+            ws.column_dimensions[column].width = min(max(length + 2, 10), 80)
+
     def _style_header(self, ws):
-        """Apply styling to header row"""
         header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
         header_font = Font(bold=True, color='FFFFFF')
-        
         for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal='center')
-    
+            cell.fill = header_fill; cell.font = header_font; cell.alignment = Alignment(horizontal='center')
+
+    # ---------------------- Learning from Excel (per-Excel state + merges) ----------------------
     def learn_from_excel_corrections(self, filepath):
-        """
-        Read Excel file and learn from user corrections in 'Correct Topic' column
-        """
         if not os.path.exists(filepath):
             return 0
-        
         try:
             wb = openpyxl.load_workbook(filepath)
-            ws = wb['Emails']
-            
-            corrections_found = 0
-            corrections_ws = wb['Corrections']
-            
-            # Find 'Correct Topic' column (should be last column)
-            correct_topic_col = None
-            for col in range(1, ws.max_column + 1):
-                if ws.cell(1, col).value == 'Correct Topic':
-                    correct_topic_col = col
-                    break
-            
-            if not correct_topic_col:
-                wb.close()
-                return 0
-            
-            # Read corrections
-            for row_idx in range(2, ws.max_row + 1):
-                correct_topic = ws.cell(row_idx, correct_topic_col).value
-                
-                if correct_topic and correct_topic.strip():
-                    # User specified a correction
-                    msg_id_col = 1  # Assuming message ID is stored somewhere
-                    # For now, use row content to identify
-                    date = ws.cell(row_idx, 1).value
-                    ai_topic = ws.cell(row_idx, 2).value
-                    subject = ws.cell(row_idx, 5).value if ws.max_column >= 5 else ''
-                    
-                    correct_topic = correct_topic.strip()
-                    
-                    # Add to corrections sheet
-                    corrections_ws.append([
-                        f"row_{row_idx}",  # Placeholder ID
-                        ai_topic,
-                        correct_topic,
-                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        subject
-                    ])
-                    
-                    corrections_found += 1
-            
-            if corrections_found > 0:
+            ws_emails = wb['Emails']; ws_corr = wb['Corrections']
+            headers = {ws_emails.cell(1, c).value: c for c in range(1, ws_emails.max_column + 1)}
+            subj_col = headers.get('Subject'); body_col = headers.get('Body Preview')
+            correct_col = headers.get('Correct Topic'); msgid_col = headers.get('Message ID')
+            if not correct_col:
+                wb.close(); return 0
+            synced = 0
+            for r in range(2, ws_emails.max_row + 1):
+                corrected = ws_emails.cell(r, correct_col).value
+                if corrected and str(corrected).strip():
+                    ai_topic = ws_emails.cell(r, headers.get('Topic')).value if headers.get('Topic') else ''
+                    subj = ws_emails.cell(r, subj_col).value if subj_col else ''
+                    msg_id = ws_emails.cell(r, msgid_col).value if msgid_col else f"row_{r}"
+                    ws_corr.append([str(msg_id).strip(), ai_topic, str(corrected).strip(),
+                                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'), subj])
+                    synced += 1
+            if synced > 0:
                 wb.save(filepath)
-            
+            # Build centroids from Corrections
+            ws_corr = wb['Corrections']; corrected_rows = []
+            subj_idx = headers.get('Subject', 5); body_idx = headers.get('Body Preview', 11)
+            emails_rows = list(ws_emails.iter_rows(min_row=2, values_only=True))
+            for row in ws_corr.iter_rows(min_row=2, values_only=True):
+                ctopic = (row[2] or '').strip(); subj = (row[4] or '').strip() if len(row) > 4 and row[4] else ''
+                if not ctopic or not subj:
+                    continue
+                for rr in emails_rows:
+                    e_subj = (rr[subj_idx - 1] or '').strip()
+                    if e_subj == subj:
+                        e_body = rr[body_idx - 1] or ''
+                        corrected_rows.append((ctopic, subj, e_body))
+                        break
+            # TopicMap rules (for merging centroids)
+            self.topicmap_rules = {}
+            if 'TopicMap' in wb.sheetnames:
+                ws_tm = wb['TopicMap']
+                for row in ws_tm.iter_rows(min_row=2, values_only=True):
+                    if row[0]:
+                        self.topicmap_rules[str(row[0]).strip()] = {
+                            'name': (row[1] or '').strip(), 'merge': (row[2] or '').strip()
+                        }
             wb.close()
-            return corrections_found
-            
+            if not corrected_rows:
+                return synced
+            self._ensure_bert()
+            from sklearn.preprocessing import normalize
+            texts, labels = [], []
+            for ctopic, subj, body in corrected_rows:
+                texts.append(f"{subj}\n\n{self._clean_for_embedding(body)}"); labels.append(ctopic)
+            embs = self.bert_model.encode(texts, convert_to_numpy=True, show_progress_bar=False, batch_size=8)
+            embs = normalize(embs)
+            from collections import defaultdict
+            sums = defaultdict(lambda: None); counts = defaultdict(int)
+            for vec, lab in zip(embs, labels):
+                if sums[lab] is None: sums[lab] = vec.copy()
+                else: sums[lab] += vec
+                counts[lab] += 1
+            centroids = {}
+            for lab in sums:
+                c = sums[lab] / max(1, counts[lab]); c = c / (np.linalg.norm(c) + 1e-9)
+                centroids[lab] = c
+            # Apply TopicMap merges to centroids
+            merged = {}; group = {}
+            def target_of(t: str) -> str:
+                cur = t; seen = set()
+                while cur in self.topicmap_rules and self.topicmap_rules[cur].get('merge'):
+                    if cur in seen: break
+                    seen.add(cur)
+                    cur = self.topicmap_rules[cur]['merge']
+                return cur
+            for name, vec in centroids.items():
+                tgt = target_of(name)
+                group.setdefault(tgt, []).append(vec)
+            for tgt, vecs in group.items():
+                m = np.mean(np.vstack(vecs), axis=0)
+                m = m / (np.linalg.norm(m) + 1e-9)
+                disp = self.topicmap_rules.get(tgt, {}).get('name') or tgt
+                merged[disp] = m.tolist()
+            # Save per-Excel learning state
+            state_path = self._state_path_for_excel(filepath)
+            self.state_path = state_path
+            state = {"topics": merged, "min_confidence": self.min_confidence,
+                     "version": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
+            import json
+            with open(state_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            print(f"Saved learning state to {state_path}")
+            return synced
         except Exception as e:
             print(f"Error learning from corrections: {e}")
             return 0
 
+    def _clean_for_embedding(self, text: str) -> str:
+        if not isinstance(text, str): return ""
+        t = text.replace("\r", "\n")
+        bad_prefixes = ("From:", "Sent:", "De :", "Envoyé", "주의", "CAUTION", "Sujet:", "Subject:")
+        lines = []
+        for ln in t.split("\n"):
+            l = ln.strip()
+            if not l or any(l.startswith(bp) for bp in bad_prefixes) or l.startswith(">"):
+                continue
+            lines.append(l)
+            if len(lines) >= 300:
+                break
+        return " ".join(lines)
 
-# GUI class continues in next part...
 
-
+# ---------------------- GUI ----------------------
 class EmailOrganizerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Email Topic Organizer - BERT AI with Learning")
+        self.root.title("Email Topic Organizer - BERT AI with Learning (Patched v2)")
         self.root.geometry("800x650")
-        
         self.organizer = EmailOrganizer()
         self.dropped_files = []
         self.drag_drop_available = False
-        
-        self.setup_ui()
-        self.setup_drag_drop()
-    
+        self.setup_ui(); self.setup_drag_drop()
+
     def setup_ui(self):
-        """Create the user interface"""
-        # Title
-        title = tk.Label(self.root, text="📧 Email Topic Organizer - Smart AI", 
-                        font=('Arial', 16, 'bold'))
+        title = tk.Label(self.root, text="📧 Email Topic Organizer - Smart AI", font=('Arial', 16, 'bold'))
         title.pack(pady=10)
-        
-        # Info
-        info = tk.Label(self.root, 
-            text="✨ BERT AI • 85-90% Accuracy • Learns from Your Corrections • Multi-language\n"
-                 "💡 Tip: Add 'Topic: YourCategory' in email body to force grouping",
-            justify=tk.CENTER, fg='#666')
+        info = tk.Label(self.root,
+                        text=("✨ BERT AI • Cosine Confidence • Learns from Excel • Multi-language\n"
+                              "💡 Tip: Add 'Topic: YourCategory' in email body to force grouping"),
+                        justify=tk.CENTER, fg='#666')
         info.pack(pady=5)
-        
-        # Drop zone
         drop_frame = tk.Frame(self.root, bg='#e8f4f8', relief=tk.SOLID, borderwidth=2)
         drop_frame.pack(padx=20, pady=10, fill=tk.BOTH, expand=True)
-        
         drop_text = "📁 Select .eml or .msg files using Browse button\n\nSupported: .eml, .msg | Thread detection: Auto"
         if self.drag_drop_available:
             drop_text = "📁 Drop email files here or use Browse button\n\nSupported: .eml, .msg | Thread detection: Auto"
-        
-        self.drop_label = tk.Label(drop_frame, 
-            text=drop_text,
-            bg='#e8f4f8', font=('Arial', 12), justify=tk.CENTER)
+        self.drop_label = tk.Label(drop_frame, text=drop_text, bg='#e8f4f8', font=('Arial', 12), justify=tk.CENTER)
         self.drop_label.pack(expand=True)
-        
-        # File list
-        list_frame = tk.Frame(self.root)
-        list_frame.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
-        
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+        list_frame = tk.Frame(self.root); list_frame.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(list_frame); scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, height=8)
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.file_listbox.yview)
-        
-        # Buttons
-        btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=10)
-        
-        self.browse_btn = tk.Button(btn_frame, text="📂 Browse Files", 
-                                    command=self.browse_files, width=15)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); scrollbar.config(command=self.file_listbox.yview)
+        btn_frame = tk.Frame(self.root); btn_frame.pack(pady=10)
+        self.browse_btn = tk.Button(btn_frame, text="📂 Browse Files", command=self.browse_files, width=15)
         self.browse_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.clear_btn = tk.Button(btn_frame, text="🗑️ Clear List", 
-                                   command=self.clear_files, width=15)
+        self.clear_btn = tk.Button(btn_frame, text="🗑️ Clear List", command=self.clear_files, width=15)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.process_btn = tk.Button(btn_frame, text="⚡ Process & Export", 
-                                     command=self.process_emails, 
-                                     width=15, bg='#4CAF50', fg='white',
-                                     font=('Arial', 10, 'bold'))
+        self.process_btn = tk.Button(btn_frame, text="⚡ Process & Export", command=self.process_emails,
+                                     width=15, bg='#4CAF50', fg='white', font=('Arial', 10, 'bold'))
         self.process_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Advanced buttons
-        btn_frame2 = tk.Frame(self.root)
-        btn_frame2.pack(pady=5)
-        
-        self.learn_btn = tk.Button(btn_frame2, text="🧠 Learn from Excel", 
-                                   command=self.learn_from_corrections,
+        btn_frame2 = tk.Frame(self.root); btn_frame2.pack(pady=5)
+        self.learn_btn = tk.Button(btn_frame2, text="🧠 Learn from Excel", command=self.learn_from_corrections,
                                    width=18, bg='#2196F3', fg='white')
         self.learn_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.help_btn = tk.Button(btn_frame2, text="❓ How to Use", 
-                                 command=self.show_help,
-                                 width=18)
+        self.help_btn = tk.Button(btn_frame2, text="❓ How to Use", command=self.show_help, width=18)
         self.help_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Status
         self.status_label = tk.Label(self.root, text="Ready - BERT AI will download on first use (~420MB)", fg='green')
         self.status_label.pack(pady=5)
-        
-        # Progress bar
-        self.progress = ttk.Progressbar(self.root, mode='indeterminate')
-        self.progress.pack(padx=20, pady=5, fill=tk.X)
-    
+        self.progress = ttk.Progressbar(self.root, mode='indeterminate'); self.progress.pack(padx=20, pady=5, fill=tk.X)
+
     def setup_drag_drop(self):
-        """Enable drag and drop functionality if available"""
         try:
             from tkinterdnd2 import TkinterDnD
             self.root.drop_target_register('DND_Files')
@@ -944,289 +872,180 @@ class EmailOrganizerGUI:
         except Exception as e:
             print(f"Drag and drop not available: {e}")
             self.drag_drop_available = False
-    
+
     def on_drop(self, event):
-        """Handle dropped files"""
         try:
             files = self.root.tk.splitlist(event.data)
             self.add_files(files)
         except Exception as e:
             print(f"Error handling drop: {e}")
-    
+
     def browse_files(self):
-        """Browse for email files"""
-        files = filedialog.askopenfilenames(
-            title="Select Email Files",
-            filetypes=[("Email files", "*.eml *.msg"), ("All files", "*.*")]
-        )
+        files = filedialog.askopenfilenames(title="Select Email Files",
+                                            filetypes=[("Email files", "*.eml *.msg"), ("All files", "*.*")])
         if files:
             self.add_files(files)
-    
+
     def add_files(self, files):
-        """Add files to the list"""
         for filepath in files:
-            if filepath.lower().endswith(('.eml', '.msg')):
-                if filepath not in self.dropped_files:
-                    self.dropped_files.append(filepath)
-                    self.file_listbox.insert(tk.END, Path(filepath).name)
-        
+            if filepath.lower().endswith(('.eml', '.msg')) and filepath not in self.dropped_files:
+                self.dropped_files.append(filepath)
+                self.file_listbox.insert(tk.END, Path(filepath).name)
         self.update_status(f"{len(self.dropped_files)} files ready")
-    
+
     def clear_files(self):
-        """Clear the file list"""
         self.dropped_files = []
         self.file_listbox.delete(0, tk.END)
         self.update_status("Ready")
-    
+
     def process_emails(self):
-        """Process all emails and export to Excel - THREADED VERSION"""
         if not self.dropped_files:
-            messagebox.showwarning("No Files", "Please add email files first")
-            return
-        
-        excel_path = filedialog.asksaveasfilename(
-            title="Save Excel File As",
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")]
-        )
-        
+            messagebox.showwarning("No Files", "Please add email files first"); return
+        excel_path = filedialog.asksaveasfilename(title="Save Excel File As", defaultextension=".xlsx",
+                                                  filetypes=[("Excel files", "*.xlsx")])
         if not excel_path:
             return
-        
-        # Disable buttons during processing
-        self.process_btn.config(state=tk.DISABLED)
-        self.browse_btn.config(state=tk.DISABLED)
-        self.clear_btn.config(state=tk.DISABLED)
-        
-        # Start threaded processing
+        # Remember Excel path (for per-Excel learning state)
+        self.organizer.excel_path = excel_path
+        self.organizer.state_path = self.organizer._state_path_for_excel(excel_path)
+        self.process_btn.config(state=tk.DISABLED); self.browse_btn.config(state=tk.DISABLED); self.clear_btn.config(state=tk.DISABLED)
+
         def process_thread():
             try:
-                # Load existing data
                 processed_ids = self.organizer.load_existing_excel(excel_path)
-                
-                # Parse emails
-                new_emails = 0
-                skipped = 0
-                failed_files = []
-                total_threads = 0
-                
+                new_emails = 0; skipped = 0; failed_files = []; total_threads = 0
                 self.root.after(0, lambda: self.update_status(f"Parsing {len(self.dropped_files)} email files..."))
-                
                 for filepath in self.dropped_files:
                     try:
-                        email_data = self.organizer.parse_email_file(filepath)
-                        if email_data:
-                            msg_id = str(email_data['message_id']).strip()
-                            
-                            if msg_id not in processed_ids:
-                                self.organizer.emails.append(email_data)
-                                new_emails += 1
-                                total_threads += email_data.get('thread_count', 1)
+                        data = self.organizer.parse_email_file(filepath)
+                        if data:
+                            mid = str(data['message_id']).strip()
+                            if mid not in processed_ids:
+                                self.organizer.emails.append(data); new_emails += 1
+                                total_threads += data.get('thread_count', 1)
                             else:
                                 skipped += 1
                     except Exception as e:
                         failed_files.append((Path(filepath).name, str(e)))
                         print(f"Failed to parse {filepath}: {e}")
-                
                 if new_emails == 0:
-                    self.root.after(0, lambda: self._show_no_new_emails(skipped))
-                    return
-                
-                # Classify with BERT (this is the slow part)
-                self.root.after(0, lambda: self.update_status(f"🧠 BERT processing {new_emails} emails (20-30 seconds on your Intel Ultra 7)..."))
-                self.root.after(0, lambda: self.progress.start(10))  # Smoother animation
-                
+                    self.root.after(0, lambda: self._show_no_new_emails(skipped)); return
+                self.root.after(0, lambda: self.update_status(f"🧠 BERT processing {new_emails} emails — this may take a moment..."))
+                self.root.after(0, lambda: self.progress.start(10))
                 success = self.organizer.classify_topics_with_bert()
-                
                 if not success:
-                    self.root.after(0, lambda: self._show_error("BERT classification failed"))
-                    return
-                
-                # Save to Excel
+                    self.root.after(0, lambda: self._show_error("BERT classification failed")); return
                 self.root.after(0, lambda: self.update_status("💾 Saving to Excel..."))
                 self.organizer.save_to_excel(excel_path)
-                
-                # Show success
                 self.root.after(0, lambda: self._show_success(new_emails, total_threads, skipped, failed_files, excel_path))
-                
-                # Clear for next batch
-                self.root.after(0, lambda: self.clear_files())
-                self.organizer.emails = []
-                
+                self.root.after(0, lambda: self.clear_files()); self.organizer.emails = []
             except Exception as e:
                 import traceback
-                error_details = traceback.format_exc()
-                print(f"Error processing emails:\n{error_details}")
+                print("Error processing emails:\n" + traceback.format_exc())
                 self.root.after(0, lambda: self._show_error(str(e)))
             finally:
-                # Re-enable buttons
                 self.root.after(0, lambda: self.process_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.browse_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.clear_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.progress.stop())
-        
-        # Start thread
+
         import threading
-        thread = threading.Thread(target=process_thread, daemon=True)
-        thread.start()
-        
-        self.update_status("⚙️ Processing started in background...")
-        self.progress.start()
-    
+        thread = threading.Thread(target=process_thread, daemon=True); thread.start()
+        self.update_status("⚙️ Processing started in background..."); self.progress.start()
+
     def _show_no_new_emails(self, skipped):
-        """Show no new emails message"""
-        self.progress.stop()
-        info_msg = "All selected emails have already been processed or failed to parse."
-        if skipped > 0:
-            info_msg += f"\n\nSkipped: {skipped} duplicates"
-        messagebox.showinfo("No New Emails", info_msg)
-        self.update_status("No new emails to process")
-    
+        self.progress.stop(); info_msg = "All selected emails have already been processed or failed to parse."
+        if skipped > 0: info_msg += f"\n\nSkipped: {skipped} duplicates"
+        messagebox.showinfo("No New Emails", info_msg); self.update_status("No new emails to process")
+
     def _show_error(self, error_msg):
-        """Show error message"""
-        self.progress.stop()
-        messagebox.showerror("Error", f"Failed to process emails:\n{error_msg}")
+        self.progress.stop(); messagebox.showerror("Error", f"Failed to process emails:\n{error_msg}")
         self.update_status("❌ Error occurred")
-    
+
     def _show_success(self, new_emails, total_threads, skipped, failed_files, excel_path):
-        """Show success message"""
         self.progress.stop()
         info_msg = f"✅ Processed: {new_emails} emails ({total_threads} messages in threads)\n"
         info_msg += f"🎯 Topic keywords found: {len(self.organizer.topic_keywords)}\n"
-        if skipped > 0:
-            info_msg += f"⏭️ Skipped: {skipped} duplicates\n"
-        if failed_files:
-            info_msg += f"❌ Failed: {len(failed_files)} files\n"
+        if skipped > 0: info_msg += f"⏭️ Skipped: {skipped} duplicates\n"
+        if failed_files: info_msg += f"❌ Failed: {len(failed_files)} files\n"
         info_msg += f"\n📁 Saved to:\n{excel_path}\n\n"
-        info_msg += "💡 Tip: Edit 'Correct Topic' column and click 'Learn from Excel' to improve AI!"
-        
+        info_msg += "💡 Tip: Fill 'Correct Topic' in Excel and click 'Learn from Excel' to improve AI!"
         messagebox.showinfo("Success!", info_msg)
-        self.update_status(f"✅ Success! Processed {new_emails} emails with BERT AI (85-90% accuracy)")
-    
+        self.update_status(f"✅ Success! Processed {new_emails} emails with BERT AI")
+
     def learn_from_corrections(self):
-        """Learn from user corrections in Excel"""
-        excel_path = filedialog.askopenfilename(
-            title="Select Excel File to Learn From",
-            filetypes=[("Excel files", "*.xlsx")]
-        )
-        
+        excel_path = filedialog.askopenfilename(title="Select Excel File to Learn From", filetypes=[("Excel files", "*.xlsx")])
         if not excel_path:
             return
-        
-        self.update_status("Learning from your corrections...")
-        self.progress.start()
-        self.root.update()
-        
+        self.organizer.excel_path = excel_path
+        self.organizer.state_path = self.organizer._state_path_for_excel(excel_path)
+        self.update_status("Learning from your corrections..."); self.progress.start(); self.root.update()
         try:
             corrections_found = self.organizer.learn_from_excel_corrections(excel_path)
-            
             self.progress.stop()
-            
             if corrections_found > 0:
-                messagebox.showinfo("Learning Complete", 
-                    f"Learned from {corrections_found} corrections!\n\n"
-                    f"These corrections will be applied to future emails.\n\n"
-                    f"The AI now knows your preferences better! 🧠")
+                messagebox.showinfo(
+                    "Learning Complete",
+                    "Learned from your corrections! A per-file learning state was saved next to your Excel."
+                )
                 self.update_status(f"✅ Learned from {corrections_found} corrections")
             else:
-                messagebox.showinfo("No Corrections Found", 
-                    "No corrections found in 'Correct Topic' column.\n\n"
-                    "To teach the AI:\n"
-                    "1. Open the Excel file\n"
-                    "2. Fill in 'Correct Topic' column for misclassified emails\n"
-                    "3. Save and click 'Learn from Excel' again")
+                messagebox.showinfo(
+                    "No Corrections Found",
+                    "No corrections found in 'Correct Topic'.\nOpen Excel → fill 'Correct Topic' → Save → Learn again."
+                )
                 self.update_status("No corrections to learn from")
-        
         except Exception as e:
-            self.progress.stop()
-            messagebox.showerror("Error", f"Failed to learn from Excel:\n{str(e)}")
+            self.progress.stop(); messagebox.showerror("Error", f"Failed to learn from Excel:\n{str(e)}")
             self.update_status("❌ Error occurred")
-    
+
     def show_help(self):
-        """Show help dialog"""
-        help_text = """
-📧 EMAIL TOPIC ORGANIZER - SMART AI HELP
+        help_text = (
+            """
+📧 EMAIL TOPIC ORGANIZER - SMART AI HELP (Patched v2)
 
 🎯 HOW IT WORKS:
 1. Select .eml or .msg files
 2. Click "Process & Export"
-3. AI groups emails by topic (85-90% accuracy)
+3. AI groups emails by topic (cosine confidence, auto-K)
 4. Export to Excel with 5 sheets
 
-📊 EXCEL SHEETS:
-• Emails: All emails with topics and confidence scores
-• Summary: Topic statistics
-• TopicMap: Rename or merge topics here
-• Corrections: AI learning history
-• Index: Processed email tracking
+🧠 LEARNING (per Excel file):
+• Fill "Correct Topic" in Emails sheet
+• Click "Learn from Excel" → saves <YourWorkbook>.learning_state.json next to your Excel
+• Next runs load this state automatically
 
-🧠 TEACHING THE AI:
-Method 1 - Force Topic in Email:
-  Add "Topic: YourCategory" in email body
-  Example: "Topic: Purchase Request"
-  → AI will group with same topic
+🧩 TOPICMAP (Merge Into + Rename):
+• Use TopicMap sheet to merge/rename topics (e.g., Topic_3 → tool PO)
+• Merges affect learned centroids and final topics
 
-Method 2 - Correct in Excel:
-  1. Fill "Correct Topic" column for wrong emails
-  2. Save Excel
-  3. Click "Learn from Excel"
-  → AI learns your preferences!
+📝 FORMATTING:
+• Body Preview & Conversation Summary: "sender | date | key sentence"
+• Greetings like "안녕하세요" / "Hello" removed
 
-Method 3 - Merge Topics:
-  1. Open TopicMap sheet
-  2. Fill "Merge Into" column
-     Example: Topic_3 → Topic_2
-  3. Process new emails
-  → Merged automatically
+🔧 NOTES:
+• Confidence < 0.65 → Uncertain (review in Excel)
+• 100% local & private
+            """
+        )
+        win = tk.Toplevel(self.root); win.title("Help - How to Use"); win.geometry("600x700")
+        txt = tk.Text(win, wrap=tk.WORD, padx=10, pady=10); txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert(1.0, help_text); txt.config(state=tk.DISABLED)
+        tk.Button(win, text="Close", command=win.destroy).pack(pady=10)
 
-💡 TIPS:
-• Confidence <0.7 = Review recommended
-• Topic keywords override AI
-• AI learns from 10+ corrections
-• Multi-language support (Korean, English, French)
-• Thread detection: automatic
-
-🔧 FEATURES:
-✅ BERT AI (best accuracy)
-✅ Learn from corrections
-✅ Topic keywords in email
-✅ Conversation thread detection
-✅ Multi-language support
-✅ Confidence scores
-✅ 100% local & private
-
-❓ Questions? Check Excel file for examples!
-        """
-        
-        help_window = tk.Toplevel(self.root)
-        help_window.title("Help - How to Use")
-        help_window.geometry("600x700")
-        
-        text_widget = tk.Text(help_window, wrap=tk.WORD, padx=10, pady=10)
-        text_widget.pack(fill=tk.BOTH, expand=True)
-        text_widget.insert(1.0, help_text)
-        text_widget.config(state=tk.DISABLED)
-        
-        close_btn = tk.Button(help_window, text="Close", command=help_window.destroy)
-        close_btn.pack(pady=10)
-    
     def update_status(self, message):
-        """Update status label"""
-        self.status_label.config(text=message)
-        self.root.update()
+        self.status_label.config(text=message); self.root.update()
 
 
 def main():
     try:
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
-    except:
+    except Exception:
         root = tk.Tk()
-    
     app = EmailOrganizerGUI(root)
     root.mainloop()
 
 
 if __name__ == '__main__':
     main()
-
